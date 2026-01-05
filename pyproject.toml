@@ -1,0 +1,88 @@
+[project]
+name = "vibemask"
+version = "0.2.0"
+description = "Privacy-preserving AI tool wrapper with automatic masking and restoration"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "VibeMask Team" }]
+keywords = ["privacy", "masking", "ai", "anonymization", "pii"]
+
+# Core dependencies only (~8MB) - minimal installation
+dependencies = [
+    "typer>=0.9.0",
+    "rich>=13.0.0",
+    "pydantic>=2.0.0",
+    "lxml>=5.0.0",        # OOXML lossless processing
+]
+
+[project.optional-dependencies]
+# Office document support (python-docx/openpyxl/pptx for legacy mode)
+office = [
+    "python-docx>=1.0.0",
+    "openpyxl>=3.1.0",
+    "python-pptx>=0.6.0",
+]
+
+# PDF support
+pdf = [
+    "pymupdf>=1.23.0",
+]
+
+# Web UI and API
+web = [
+    "fastapi>=0.104.0",
+    "uvicorn>=0.24.0",
+    "python-multipart>=0.0.6",
+]
+
+# AI tool wrapper integration
+wrapper = [
+    "httpx>=0.25.0",
+]
+
+# Secure storage (keychain/keyring)
+secure = [
+    "keyring>=24.0.0",
+    "cryptography>=41.0.0",
+]
+
+# Model judge (ONNX offline)
+model = [
+    "onnxruntime>=1.16.0",
+    "transformers>=4.35.0",
+]
+
+# Development tools
+dev = [
+    "pytest>=7.0.0",
+    "pytest-asyncio>=0.21.0",
+    "black>=23.0.0",
+    "ruff>=0.1.0",
+]
+
+# Standard installation (Office + Web)
+standard = [
+    "vibemask[office,web,wrapper]",
+]
+
+# Full installation (everything except model)
+full = [
+    "vibemask[office,pdf,web,wrapper,secure]",
+]
+
+[project.scripts]
+vibemask = "vibemask.cli:app"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.black]
+line-length = 100
+target-version = ["py310"]
+

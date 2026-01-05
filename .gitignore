@@ -1,0 +1,95 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+
+# Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# PyInstaller
+*.manifest
+*.spec
+
+# Installer logs
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Unit test / coverage reports
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.py,cover
+.hypothesis/
+.pytest_cache/
+
+# Translations
+*.mo
+*.pot
+
+# Environments
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Project specific
+temp_uploads/
+ollama.log
+*.log
+
+# Vault data (stored in ~/.vibemask, never in project)
+.vibemask/
+
+# Node.js (for vibemask-ui)
+vibemask-ui/node_modules/
+vibemask-ui/dist/
+vibemask-ui/.next/
+vibemask-ui/src-tauri/binaries/
+vibemask-ui/src-tauri/target/
+
+# Test files (keep sample files, ignore generated)
+tests/*_masked.*
+tests/*_restored.*
+
+# Config with secrets
+.vibemask.yaml
+!.vibemask.yaml.example

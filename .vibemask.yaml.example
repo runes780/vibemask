@@ -1,0 +1,66 @@
+# VibeMask 项目配置示例
+# 复制此文件为 .vibemask.yaml 并根据需要修改
+
+# 启用的敏感信息类型
+enabled_types:
+  - PERSON    # 人名
+  - PHONE     # 手机号
+  - EMAIL     # 邮箱
+  - IDCN      # 身份证号
+  # - ORG     # 组织名（可选）
+  # - ADDRESS # 地址（可选）
+
+# Ollama 小模型配置（用于人名判定）
+ollama:
+  enabled: false  # MVP 阶段暂不启用
+  model: qwen2.5:3b
+  endpoint: http://localhost:11434
+  timeout_ms: 2000
+
+# 脱敏策略
+masking:
+  # 长度保持模式: off | basic | strict
+  length_preserve_mode: basic
+  
+  # 邮箱处理
+  email:
+    preserve_domain: true  # 保留域名部分
+  
+  # 人名处理
+  person:
+    style: chinese_pseudoname  # 使用"赵甲乙"风格假名
+    stable_within_project: true  # 同一人名总是映射到同一假名
+
+# 路径配置
+paths:
+  # 包含的路径（glob 模式）
+  include:
+    - "**/*"
+  
+  # 排除的路径
+  exclude:
+    - "**/.git/**"
+    - "**/node_modules/**"
+    - "**/dist/**"
+    - "**/__pycache__/**"
+    - "**/.venv/**"
+    - "**/venv/**"
+
+# 结构化字段识别（JSON/YAML 的 key）
+schema_keys:
+  - name
+  - username
+  - student_name
+  - parent_name
+  - phone
+  - mobile
+  - tel
+  - email
+  - id_card
+  - idcard
+  - address
+
+# 白名单（不进行脱敏的词汇）
+whitelist:
+  # - 产品名称
+  # - 游戏角色名
