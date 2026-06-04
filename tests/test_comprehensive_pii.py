@@ -13,7 +13,6 @@ Tests all PII types defined in Chinese personal information regulations:
 
 import sys
 from pathlib import Path
-import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
@@ -21,7 +20,7 @@ if str(REPO_ROOT) not in sys.path:
 
 
 class TestPlaceholderGeneration:
-    """Test that placeholder generation is length-preserving and reversible."""
+    """Test placeholder generation for reversible masking."""
     
     def setup_method(self):
         from vibemask.masker.placeholder import PlaceholderGenerator
@@ -32,7 +31,7 @@ class TestPlaceholderGeneration:
         from vibemask.core.span import EntityType
         original = "张三"
         masked = self.generator.generate(original, EntityType.PERSON)
-        assert len(masked) == len(original), f"Length mismatch: {original}({len(original)}) -> {masked}({len(masked)})"
+        assert masked == "{{PERSON_000001}}"
         assert masked != original, "Masked should differ from original"
     
     def test_person_name_3char(self):
@@ -40,14 +39,14 @@ class TestPlaceholderGeneration:
         from vibemask.core.span import EntityType
         original = "李明华"
         masked = self.generator.generate(original, EntityType.PERSON)
-        assert len(masked) == len(original)
+        assert masked == "{{PERSON_000001}}"
     
     def test_person_name_4char_compound(self):
         """4-character name with compound surname."""
         from vibemask.core.span import EntityType
         original = "欧阳小雪"
         masked = self.generator.generate(original, EntityType.PERSON)
-        assert len(masked) == len(original)
+        assert masked == "{{PERSON_000001}}"
     
     def test_phone_11_digits(self):
         """11-digit Chinese mobile number."""
@@ -117,6 +116,22 @@ class TestPlaceholderGeneration:
         original = "https://example.com/user/123"
         masked = self.generator.generate(original, EntityType.URL)
         assert masked.startswith("https://example.com"), "URL protocol and domain preserved"
+
+    def test_account_number_generic_mask(self):
+        """Privacy Filter account_number type gets a length-preserving placeholder."""
+        from vibemask.core.span import EntityType
+        original = "4111111111111111"
+        masked = self.generator.generate(original, EntityType.ACCOUNT_NUMBER)
+        assert len(masked) == len(original)
+        assert masked.isdigit()
+
+    def test_secret_generic_mask(self):
+        """Privacy Filter secret type gets a length-preserving placeholder."""
+        from vibemask.core.span import EntityType
+        original = "sk-test-secret"
+        masked = self.generator.generate(original, EntityType.SECRET)
+        assert len(masked) == len(original)
+        assert masked != original
     
     def test_reverse_mappings(self):
         """Verify reverse mappings are created correctly."""
@@ -147,12 +162,12 @@ class TestVaultRoundtrip:
         masked1 = vault.get_or_create_mapping(
             original="张三",
             entity_type="PERSON",
-            masked="赵甲"
+            masked="{{PERSON_000001}}"
         )
         masked2 = vault.get_or_create_mapping(
             original="张三",
             entity_type="PERSON",
-            masked="赵甲"
+            masked="{{PERSON_000001}}"
         )
         
         assert masked1 == masked2, "Same original should return same masked"
@@ -167,12 +182,12 @@ class TestVaultRoundtrip:
         masked1 = vault.get_or_create_mapping(
             original="张三",
             entity_type="PERSON",
-            masked="赵甲"
+            masked="{{PERSON_000001}}"
         )
         masked2 = vault.get_or_create_mapping(
             original="李四",
             entity_type="PERSON",
-            masked="赵甲"  # Same proposed mask
+            masked="{{PERSON_000001}}"  # Same proposed mask
         )
         
         assert masked1 != masked2, "Different originals should get unique masked values"
@@ -189,7 +204,7 @@ class TestVaultRoundtrip:
         vault = VaultStorage(str(tmp_path / "project"))
         
         test_data = [
-            ("张三", "PERSON", "赵甲"),
+            ("张三", "PERSON", "{{PERSON_000001}}"),
             ("13812345678", "PHONE", "13900000000"),
             ("test@example.com", "EMAIL", "u000@example.com"),
         ]
@@ -230,6 +245,17 @@ class TestFalsePositivePrevention:
                 spans = detector.detect(f"这是一个{word}的测试", strict=False)
                 detected_texts = [s.text for s in spans]
                 assert word not in detected_texts, f"'{word}' should NOT be detected as a name"
+
+    def test_administrative_divisions_excluded(self):
+        """Administrative divisions should not be detected as person names."""
+        from vibemask.detector.smart_detector import SmartChineseNameDetector
+
+        detector = SmartChineseNameDetector(use_llm=False)
+        spans = detector.detect("淳安县列入名单，杭州市同步推进。", strict=False)
+        detected_texts = [s.text for s in spans]
+
+        assert "淳安县" not in detected_texts
+        assert "杭州市" not in detected_texts
 
 
 class TestTextRoundtrip:

@@ -89,7 +89,9 @@ def test_cli_mask_no_convert_legacy_skips_libreoffice(tmp_path: Path, monkeypatc
     monkeypatch.setattr(llm_scanner.LLMScanner, "scan_and_rewrite", _dummy_scan_and_rewrite)
 
     runner = CliRunner()
-    result = runner.invoke(app, ["mask", str(legacy_path), "--no-convert-legacy"])
+    result = runner.invoke(
+        app,
+        ["mask", str(legacy_path), "--no-convert-legacy", "--engine", "qwen"],
+    )
     assert result.exit_code == 0
     assert calls["count"] == 0
-

@@ -3,7 +3,7 @@ Smart Detector with Jieba Segmentation and spaCy NER.
 Combines word boundary detection with NER for intelligent name detection.
 """
 
-from typing import List, Set, Optional, Tuple
+from typing import List, Set, Optional
 from ..core.span import Span, EntityType, SourceType
 
 # Try to import optional dependencies
@@ -56,6 +56,17 @@ COMPOUND_SURNAMES: Set[str] = {
 
 # Title words that often follow names
 TITLE_WORDS = {"老师", "教授", "博士", "先生", "女士", "同学", "医生", "院士", "主任", "经理", "总监"}
+
+ADMIN_DIVISION_SUFFIXES = (
+    "省",
+    "市",
+    "县",
+    "区",
+    "镇",
+    "乡",
+    "村",
+    "街道",
+)
 
 # Words that look like names (surname + chars) but are NOT names
 # These are filtered out even if jieba segments them
@@ -189,8 +200,6 @@ class SmartChineseNameDetector:
         Returns:
             (normalized_text, char_map) where char_map[norm_idx] = original_idx
         """
-        import re
-        
         result = []
         char_map = []  # Maps normalized position to original position
         
@@ -375,6 +384,9 @@ class SmartChineseNameDetector:
             # CRITICAL: Skip if word is in the NON_NAME_WORDS exclusion list
             if word_text in NON_NAME_WORDS:
                 continue
+
+            if word_text.endswith(ADMIN_DIVISION_SUFFIXES):
+                continue
             
             # Calculate confidence
             confidence = self._calculate_word_confidence(text, start, end, word_text)
@@ -438,6 +450,9 @@ class SmartChineseNameDetector:
         
         # CRITICAL: Filter out known non-names even if spaCy says it's a PERSON
         if text in NON_NAME_WORDS:
+            return False
+
+        if text.endswith(ADMIN_DIVISION_SUFFIXES):
             return False
         
         # Should start with surname

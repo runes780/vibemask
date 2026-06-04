@@ -6,15 +6,16 @@ Serves as the local backend for the Tauri/React UI.
 import shutil
 import os
 from pathlib import Path
-from typing import List, Optional, Dict
+from typing import List, Dict
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
 from ..core import factory
-from ..detector.presidio_engine import VibeMaskPresidioEngine
+from ..detector.hybrid import HybridDetector
 from ..masker.placeholder import PlaceholderGenerator
+from ..core.replacer import apply_processor_replacements
 from ..vault.storage import VaultStorage
 from ..core.span import EntityType
 
@@ -68,25 +69,25 @@ async def analyze_file(
         text = processor.get_combined_text()
         
         # detect
-        engine = VibeMaskPresidioEngine()
-        results = engine.analyze(text, language=language)
+        spans = HybridDetector().detect_document(processor, text)
         
         # summarize
         generator = PlaceholderGenerator()
         summary = {}
-        for res in results:
-            if res.text not in summary:
+        for span in spans:
+            entity_type = span.type.value
+            if span.text not in summary:
                 try:
-                    etype = EntityType(res.entity_type)
-                except:
+                    etype = EntityType(entity_type)
+                except ValueError:
                     etype = EntityType.UNKNOWN
                     
-                summary[res.text] = {
-                    "type": res.entity_type,
-                    "masked": generator.generate(res.text, etype),
+                summary[span.text] = {
+                    "type": entity_type,
+                    "masked": generator.generate(span.text, etype),
                     "count": 0
                 }
-            summary[res.text]["count"] += 1
+            summary[span.text]["count"] += 1
             
         return [
             AnalysisResult(
@@ -130,8 +131,7 @@ async def mask_file(
         text = processor.get_combined_text()
         
         # Detect
-        engine = VibeMaskPresidioEngine()
-        results = engine.analyze(text, language=language)
+        spans = HybridDetector().detect_document(processor, text)
         
         # Prepare replacements
         vault = VaultStorage(str(Path.cwd()))
@@ -139,27 +139,28 @@ async def mask_file(
         replacements = {}
         stats = {}
         
-        for res in results:
-            original = res.text
-            stats[res.entity_type] = stats.get(res.entity_type, 0) + 1
+        for span in spans:
+            original = span.text
+            entity_type = span.type.value
+            stats[entity_type] = stats.get(entity_type, 0) + 1
             
             if original in replacements:
                 continue
                 
             try:
-                etype = EntityType(res.entity_type)
-            except:
+                etype = EntityType(entity_type)
+            except ValueError:
                 etype = EntityType.UNKNOWN
             
             proposed = generator.generate(original, etype)
             final = vault.get_or_create_mapping(
-                original, res.entity_type, proposed, 
-                source=res.source, confidence=res.score
+                original, entity_type, proposed,
+                source=span.source.value, confidence=span.confidence
             )
             replacements[original] = final
             
         # Apply
-        processor.replace_text(replacements)
+        apply_processor_replacements(processor, replacements, spans)
         processor.save(masked_path)
         
         # Save Session
@@ -175,9 +176,9 @@ async def mask_file(
         preview = [
             AnalysisResult(
                 original=k,
-                type=next((r.entity_type for r in results if r.text == k), "?"),
+                type=next((s.type.value for s in spans if s.text == k), "?"),
                 masked=v,
-                count=sum(1 for r in results if r.text == k)
+                count=sum(1 for s in spans if s.text == k)
             ) 
             for k, v in list(replacements.items())[:50]
         ]
@@ -221,10 +222,6 @@ async def restore_file(
             
         # Auto-detect session
         vault = VaultStorage(str(Path.cwd()))
-        
-        # Simple heuristic: try to find session with matching input file name
-        # Input: "doc_masked.docx" -> Original: "doc.docx"
-        original_guess = file.filename.replace("_masked", "")
         
         # Find session
         # We need a proper search method in Vault. 

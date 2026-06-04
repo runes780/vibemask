@@ -53,6 +53,18 @@ model = [
     "transformers>=4.35.0",
 ]
 
+# OpenAI Privacy Filter native integration
+privacy-filter = [
+    "opf @ git+https://github.com/openai/privacy-filter.git",
+]
+
+# Apple Silicon MLX backend for the Privacy Filter model
+privacy-filter-mlx = [
+    "mlx>=0.31.1",
+    "mlx-embeddings @ git+https://github.com/Blaizzy/mlx-embeddings.git",
+    "socksio>=1.0.0",
+]
+
 # Development tools
 dev = [
     "pytest>=7.0.0",
@@ -86,3 +98,5 @@ target-version = "py310"
 line-length = 100
 target-version = ["py310"]
 
+[tool.hatch.metadata]
+allow-direct-references = true

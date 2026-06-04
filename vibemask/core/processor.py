@@ -5,8 +5,11 @@ Provides consistent API for processing different document formats.
 
 from abc import ABC, abstractmethod
 from pathlib import Path
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional, Any, TYPE_CHECKING
 from dataclasses import dataclass, field
+
+if TYPE_CHECKING:
+    from .replacer import Replacement
 
 
 @dataclass
@@ -101,6 +104,16 @@ class DocumentProcessor(ABC):
             Number of replacements made
         """
         pass
+
+    def replace_spans(self, replacements: List["Replacement"]) -> int:
+        """
+        Apply position-specific replacements to the document.
+
+        Processors that cannot map combined-text offsets back to their native
+        representation should keep the default and let callers fall back to
+        replace_text().
+        """
+        raise NotImplementedError(f"{self.__class__.__name__} does not support span replacement")
     
     @abstractmethod
     def save(self, output_path: Optional[Path] = None) -> Path:
@@ -176,7 +189,7 @@ def supported_formats() -> List[str]:
 def sort_replacements(replacements: Dict[str, str]) -> List[tuple]:
     """
     Sort replacements by key length descending.
-    This prevents substring conflicts (e.g., "赵乙丑" before "赵乙").
+    This prevents substring conflicts (e.g., "江华通" before "李四").
     """
     return sorted(replacements.items(), key=lambda x: len(x[0]), reverse=True)
 

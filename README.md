@@ -10,7 +10,7 @@ Automatically mask sensitive information before AI processing, then restore afte
 
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](https://opensource.org/licenses/MIT)
-[![Tests](https://img.shields.io/badge/tests-23%20passed-brightgreen.svg)]()
+[![Tests](https://img.shields.io/badge/tests-50%20passed-brightgreen.svg)]()
 
 [Features](#-features) • [Quick Start](#-quick-start) • [Documentation](#-documentation) • [Architecture](#-architecture)
 
@@ -22,8 +22,8 @@ Automatically mask sensitive information before AI processing, then restore afte
 
 When using AI tools (Claude, ChatGPT, Copilot) with sensitive documents, private information like names, phone numbers, and IDs may be exposed. VibeMask solves this by:
 
-1. **Detecting** PII using LLM (Qwen) or rule-based engines
-2. **Masking** with length-preserving, format-preserving placeholders
+1. **Detecting** PII using a hybrid pipeline: schema/regex rules, OpenAI Privacy Filter, and optional LLM engines
+2. **Masking** with reversible typed placeholders and format-aware structured masks
 3. **Storing** mappings securely in a local vault
 4. **Restoring** original data after AI processing
 
@@ -31,8 +31,8 @@ When using AI tools (Claude, ChatGPT, Copilot) with sensitive documents, private
 
 | Feature | Description |
 |---------|-------------|
-| 🔒 **Auto Detection** | LLM-powered (Qwen) + Presidio + Regex detection |
-| 📐 **Format Preserving** | Masked text keeps same length and structure |
+| 🔒 **Auto Detection** | Hybrid detection with schema rules, regex, OpenAI Privacy Filter native spans, Qwen, and Presidio |
+| 📐 **Format Aware** | Structured values keep useful shape where possible; names use clear typed tokens |
 | 🔓 **Lossless Restore** | Perfect roundtrip: mask → AI → restore = original |
 | 💾 **Secure Vault** | SQLite storage outside project directory |
 | 🌐 **Web UI** | Modern drag-and-drop interface |
@@ -48,14 +48,39 @@ When using AI tools (Claude, ChatGPT, Copilot) with sensitive documents, private
 git clone https://github.com/your-username/vibemask.git
 cd vibemask
 
-# Install with standard dependencies
-pip install -e ".[standard]"
+# Apple Silicon default: standard dependencies plus MLX Privacy Filter support
+pip install -e ".[standard,privacy-filter-mlx]"
+
+# Optional: official OPF backend for baseline comparisons
+pip install -e ".[privacy-filter]"
 
 # For full installation (including PDF support)
 pip install -e ".[full]"
 ```
 
-### LLM Setup (Recommended)
+### Privacy Filter Setup (Recommended)
+
+VibeMask uses a hybrid detector by default. On Apple Silicon, that hybrid pipeline uses
+the MLX Privacy Filter backend unless you explicitly choose OPF. Deterministic schema
+and regex layers remain enabled for structured Office files and Chinese tabular documents.
+The CLI loads the model for the current command and exits after processing; it does not
+run a background service.
+
+```bash
+# Default: hybrid detector with MLX Privacy Filter backend
+vibemask mask document.docx
+
+# Run only OpenAI Privacy Filter when you need a pure OPF baseline
+vibemask mask document.docx --engine privacy-filter --privacy-device cpu
+
+# Run only the MLX Privacy Filter backend
+vibemask mask document.docx --engine privacy-filter-mlx
+```
+
+By default, the vault project is the input file's folder. Use `--project-root` when
+several folders should intentionally share one reversible mapping vault.
+
+### LLM Setup (Optional)
 
 ```bash
 # Install Ollama (https://ollama.ai)
@@ -66,10 +91,25 @@ ollama pull qwen3:4b-instruct
 ### Basic Usage
 
 ```bash
-# Mask a file (auto-detect PII with LLM)
+# Mask a file with the default hybrid detector
+vibemask mask document.docx
+
+# Use a specific vault project folder
+vibemask mask folder/document.docx --project-root folder
+
+# Mask with only OpenAI Privacy Filter
+vibemask mask document.docx --engine privacy-filter
+
+# Mask with the Apple Silicon MLX Privacy Filter backend
+vibemask mask document.docx --engine privacy-filter-mlx
+
+# Mask with deterministic regex rules only
+vibemask mask document.docx --engine regex
+
+# Mask with the Qwen detector
 vibemask mask document.docx --engine qwen
 
-# Mask with rule-based engine (no LLM required)
+# Mask with rule-based engine
 vibemask mask document.docx --engine presidio
 
 # Restore after AI processing
@@ -84,6 +124,35 @@ vibemask status
 # Start Web UI
 vibemask ui
 ```
+
+### Wrap Codex / Claude
+
+For one-off use, prefix any terminal command with `vibemask --`:
+
+```bash
+vibemask -- codex "帮我处理张三的材料"
+vibemask -- claude -p "总结 13812345678 这条记录"
+vibemask -- python script.py "处理张三"
+```
+
+For direct terminal use, enable shell wrappers:
+
+```bash
+eval "$(vibemask shell-init)"
+
+codex "帮我处理张三的材料"
+claude -p "总结 13812345678 这条记录"
+claude-yolo "修改这个项目"
+```
+
+The wrapper masks command-line prompt arguments locally, runs the real AI CLI once, then
+restores masked tokens in changed git files from the local vault. It does not keep a
+background model service running after the command exits. To make this permanent, add
+the `eval` line to `~/.zshrc`.
+
+If the AI tool will read sensitive files from the workspace, mask those files first with
+`vibemask mask`; the shell wrapper does not silently rewrite an entire folder before
+launching the tool.
 
 ### Python API
 
@@ -101,21 +170,21 @@ else:
 
 # Use vault for consistent mappings
 vault = VaultStorage("/path/to/project")
-masked = vault.get_or_create_mapping("张三", "PERSON", "赵甲")
+masked = vault.get_or_create_mapping("张三", "PERSON", "{{PERSON_000001}}")
 original = vault.get_mapping_by_masked(masked)  # Returns "张三"
 ```
 
 ## 📊 Supported PII Types
 
-| Type | Example | Masked | Length Preserved |
+| Type | Example | Masked | Format Strategy |
 |------|---------|--------|------------------|
-| 姓名 (PERSON) | 张三 | 赵甲 | ✅ |
-| 电话 (PHONE) | 138-1234-5678 | 140-0000-0000 | ✅ |
-| 邮箱 (EMAIL) | test@example.com | u001@example.com | ✅ |
-| 身份证 (IDCN) | 110101198801011234 | 110101198001010002 | ✅ |
-| 地址 (ADDRESS) | 北京市朝阳区xxx路123号 | 某某某某某某XXX某000某 | ✅ |
-| 日期 (DATE) | 2024-01-15 | 0000-00-00 | ✅ |
-| URL | https://example.com/user | https://example.com/U001 | ✅ |
+| 姓名 (PERSON) | 张三 | {{PERSON_000001}} | Typed opaque token |
+| 电话 (PHONE) | 138-1234-5678 | 130-0000-0000 | Separator-preserving |
+| 邮箱 (EMAIL) | test@example.com | u001@example.com | Domain-preserving |
+| 身份证 (IDCN) | 110101198801011234 | 110101198001010002 | Length-preserving |
+| 地址 (ADDRESS) | 北京市朝阳区xxx路123号 | 某某某某某某XXX某000某 | Length-aware |
+| 日期 (DATE) | 2024-01-15 | 0000-00-00 | Format-preserving |
+| URL | https://example.com/user | https://example.com/U001 | URL-shaped |
 
 ## 🏗 Architecture
 
@@ -127,6 +196,10 @@ vibemask/
 │   ├── converter.py        # Legacy Office format conversion
 │   └── span.py             # Entity types and spans
 ├── detector/               # PII Detection
+│   ├── privacy_filter.py   # OpenAI Privacy Filter native detector
+│   ├── privacy_filter_mlx.py # Apple Silicon MLX Privacy Filter backend
+│   ├── hybrid.py           # Recommended layered detector
+│   ├── schema_context.py   # Field-label/schema-aware detection
 │   ├── llm_scanner.py      # LLM-based detection (Qwen via Ollama)
 │   ├── presidio_engine.py  # Rule-based detection (Presidio)
 │   └── smart_detector.py   # Chinese name detection (Jieba + spaCy)
@@ -147,19 +220,30 @@ vibemask/
 ```mermaid
 graph LR
     A[Document] --> B{Engine?}
-    B -->|qwen| C[LLM Scanner]
-    B -->|presidio| D[Presidio + Regex]
-    C --> E[Placeholder Generator]
-    D --> E
-    E --> F[Vault Storage]
-    F --> G[Masked Document]
+    B -->|hybrid default| C[Schema + Regex]
+    C --> D[OpenAI Privacy Filter]
+    D --> E[Chinese Name Detector]
+    B -->|privacy-filter| F[OpenAI Privacy Filter Only]
+    B -->|privacy-filter-mlx| M[MLX Privacy Filter Only]
+    B -->|regex| G[Regex Only]
+    B -->|qwen| H[LLM Scanner]
+    B -->|presidio| I[Presidio + Regex]
+    E --> J[Span Merge]
+    F --> J
+    M --> J
+    G --> J
+    H --> J
+    I --> J
+    J --> K[Placeholder Generator]
+    K --> L[Vault Storage]
+    L --> M[Masked Document]
 ```
 
 ### Unique Mapping Guarantee
 
 - **Same original → Same mask**: `张三` always maps to the same placeholder
 - **Different originals → Different masks**: Auto-conflict resolution
-- **Lossless roundtrip**: mask → restore = original (verified with 23 tests)
+- **Lossless roundtrip**: mask → restore = original (verified with 50 tests)
 
 ## 📁 File Support
 
@@ -180,10 +264,14 @@ Create `.vibemask.yaml` in your project root:
 # Entity types to detect
 enabled_types: [PERSON, PHONE, EMAIL, IDCN, ADDRESS]
 
-# LLM settings
-llm:
-  model: qwen3:4b-instruct
-  base_url: http://localhost:11434
+# Detection engine
+detection:
+  engine: hybrid  # hybrid, privacy-filter, privacy-filter-mlx, regex, qwen, or presidio
+  privacy_filter:
+    backend: mlx  # mlx or opf
+    device: cpu
+    checkpoint: null  # MLX model repo/local dir, or OPF_CHECKPOINT/~/.opf/privacy_filter for OPF
+    decode_mode: viterbi
 
 # Masking options
 masking:

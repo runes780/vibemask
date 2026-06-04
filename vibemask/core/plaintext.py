@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import List, Dict, Optional
 
 from .processor import DocumentProcessor, TextSegment, register_processor, sort_replacements
+from .replacer import Replacement, apply_replacements
 
 
 @register_processor
@@ -78,6 +79,35 @@ class PlainTextProcessor(DocumentProcessor):
             self._segments[0].text = new_content
         
         return count
+
+    def replace_spans(self, replacements: List[Replacement]) -> int:
+        """Apply position-specific replacements to the content."""
+        if not self._loaded:
+            self.load()
+
+        valid_replacements = [
+            replacement
+            for replacement in replacements
+            if 0 <= replacement.start
+            and replacement.end <= len(self._content)
+            and self._content[replacement.start:replacement.end] == replacement.original
+        ]
+        if not valid_replacements:
+            return 0
+
+        self._content = apply_replacements(self._content, valid_replacements)
+
+        if self._segments:
+            self._segments = [
+                TextSegment(
+                    text=self._content,
+                    location="file",
+                    start_offset=0,
+                    end_offset=len(self._content),
+                )
+            ]
+
+        return len(valid_replacements)
     
     def save(self, output_path: Optional[Path] = None) -> Path:
         """Save the text file."""
@@ -104,6 +134,10 @@ class MarkdownProcessor(PlainTextProcessor):
     @property
     def supported_extensions(self) -> set:
         return {'.md', '.markdown'}
+
+    def replace_spans(self, replacements: List[Replacement]) -> int:
+        """Markdown extraction skips code ranges, so combined offsets are not file offsets."""
+        raise NotImplementedError("MarkdownProcessor does not support span replacement")
     
     def extract_segments(self) -> List[TextSegment]:
         """Extract text, skipping code blocks."""
