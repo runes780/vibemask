@@ -1,4 +1,3 @@
-import os
 import sys
 from pathlib import Path
 
@@ -97,11 +96,11 @@ def test_cli_mask_restore_converts_legacy_doc_to_docx(tmp_path: Path, monkeypatc
     assert masked_path.exists()
 
     masked_text = factory.extract_text(masked_path)
-    assert "赵甲" in masked_text
+    assert "{{PERSON_000001}}" in masked_text
     assert "张三" not in masked_text
 
     # Restore using the latest session created by the CLI.
-    vault = VaultStorage(str(Path.cwd()))
+    vault = VaultStorage(str(tmp_path))
     sessions = vault.list_sessions(limit=1)
     assert sessions
 
@@ -119,4 +118,4 @@ def test_cli_mask_restore_converts_legacy_doc_to_docx(tmp_path: Path, monkeypatc
 
     restored_text = factory.extract_text(restored_path)
     assert "张三" in restored_text
-    assert "赵甲" not in restored_text
+    assert "{{PERSON_000001}}" not in restored_text

@@ -34,7 +34,7 @@ def test_docx_cross_run_mask_restore_roundtrip(tmp_path: Path):
     from vibemask.core import factory
 
     # Mask with a replacement that spans runs.
-    replacements = {"张三": "赵甲"}
+    replacements = {"张三": "{{PERSON_000001}}"}
     masked_path = tmp_path / "input_masked.docx"
     proc = factory.get_processor(input_path)
     proc.load()
@@ -51,12 +51,12 @@ def test_docx_cross_run_mask_restore_roundtrip(tmp_path: Path):
     proc2 = factory.get_processor(masked_path)
     proc2.load()
     proc2.extract_segments()
-    assert proc2.replace_text({"赵甲": "张三"}) == 1
+    assert proc2.replace_text({"{{PERSON_000001}}": "张三"}) == 1
     proc2.save(restored_path)
 
     restored_text = factory.extract_text(restored_path)
     assert "张三" in restored_text
-    assert "赵甲" not in restored_text
+    assert "{{PERSON_000001}}" not in restored_text
 
     # Open with python-docx to ensure Office format isn't corrupted.
     Document(restored_path)
@@ -83,10 +83,43 @@ def test_vault_enforces_unique_masked_values(tmp_path: Path, monkeypatch: pytest
 
     vault = VaultStorage(str(tmp_path / "project"))
 
-    m1 = vault.get_or_create_mapping(original="张三", entity_type="PERSON", masked="赵甲")
-    m2 = vault.get_or_create_mapping(original="李四", entity_type="PERSON", masked="赵甲")
+    m1 = vault.get_or_create_mapping(original="张三", entity_type="PERSON", masked="{{PERSON_000001}}")
+    m2 = vault.get_or_create_mapping(original="李四", entity_type="PERSON", masked="{{PERSON_000001}}")
     assert m1 != m2
 
     # Ensure reverse lookup stays unambiguous.
     assert vault.get_mapping_by_masked(m1) == "张三"
     assert vault.get_mapping_by_masked(m2) == "李四"
+
+
+def test_vault_handles_many_short_cjk_mask_collisions(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+
+    from vibemask.vault.storage import VaultStorage
+
+    vault = VaultStorage(str(tmp_path / "project"))
+
+    masked_values = {
+        vault.get_or_create_mapping(
+            original=f"姓名{i:03d}",
+            entity_type="PERSON",
+            masked="{{PERSON_000001}}",
+        )
+        for i in range(120)
+    }
+
+    assert len(masked_values) == 120
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX permission bits only")
+def test_vault_uses_private_filesystem_permissions(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.setenv("HOME", str(tmp_path))
+
+    from vibemask.vault.storage import VaultStorage
+
+    vault = VaultStorage(str(tmp_path / "project"))
+
+    assert (vault.vault_path.parent.stat().st_mode & 0o777) == 0o700
+    assert (vault.vault_path.stat().st_mode & 0o777) == 0o600

@@ -7,8 +7,24 @@ enabled_types:
   - PHONE     # 手机号
   - EMAIL     # 邮箱
   - IDCN      # 身份证号
+  - ACCOUNT_NUMBER # 账号/银行卡/信用卡等编号
+  - SECRET    # API key、密码、OTP 等凭证
   # - ORG     # 组织名（可选）
   # - ADDRESS # 地址（可选）
+
+# 默认检测引擎
+detection:
+  engine: hybrid           # hybrid | privacy-filter | privacy-filter-mlx | regex | qwen | presidio
+  hybrid:
+    schema_enabled: true   # 字段标签/表格上下文，例如“姓名：张三”
+    regex_enabled: true    # 手机号、邮箱、身份证、URL 等确定性规则
+    privacy_enabled: true  # OpenAI Privacy Filter 上下文模型层
+    chinese_names_enabled: true # 中文姓名补强
+  privacy_filter:
+    backend: mlx           # mlx | opf；Apple Silicon 上默认使用 mlx
+    device: cpu            # cpu | cuda
+    checkpoint: null       # OPF: OPF_CHECKPOINT/~/.opf/privacy_filter；MLX: HF 模型或本地目录
+    decode_mode: viterbi   # OPF: viterbi | argmax；MLX 当前使用 argmax token labels
 
 # Ollama 小模型配置（用于人名判定）
 ollama:
@@ -28,8 +44,8 @@ masking:
   
   # 人名处理
   person:
-    style: chinese_pseudoname  # 使用"赵甲乙"风格假名
-    stable_within_project: true  # 同一人名总是映射到同一假名
+    style: typed_placeholder  # 使用 {{PERSON_000001}}，避免生成看似真实的假名
+    stable_within_project: true  # 同一人名总是映射到同一占位符
 
 # 路径配置
 paths:

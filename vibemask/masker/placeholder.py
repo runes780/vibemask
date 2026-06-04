@@ -3,7 +3,7 @@ Placeholder generator for masking sensitive data.
 Generates unique, natural-looking replacements.
 """
 
-from typing import Dict, Optional
+from typing import Dict
 from ..core.span import EntityType
 
 
@@ -12,7 +12,7 @@ from ..core.span import EntityType
 # ============================================================
 
 # Surnames for fake names (避开常用真实姓氏)
-FAKE_SURNAMES = ["赵", "钱", "孙", "李", "周", "吴", "郑", "王"]
+FAKE_SURNAMES = ["邢", "钱", "徐", "李", "宋", "崔", "荣", "赵"]
 
 # Name characters (天干地支 - looks natural, unique combinations)
 NAME_CHARS_TIANGAN = ["甲", "乙", "丙", "丁", "戊", "己", "庚", "辛", "壬", "癸"]
@@ -25,8 +25,8 @@ class PlaceholderGenerator:
     
     Design principles:
     1. Same original -> same placeholder (stable within project)
-    2. Placeholder length matches original (format preservation)
-    3. Natural-looking to reduce AI modification
+    2. Structured types keep useful format where possible
+    3. Person names use opaque typed placeholders to avoid fake real identities
     """
     
     def __init__(self):
@@ -49,7 +49,7 @@ class PlaceholderGenerator:
             return self._cache[cache_key]
         
         if entity_type == EntityType.PERSON:
-            masked = self._generate_person_name(original)
+            masked = self._generate_person_placeholder(original)
         elif entity_type == EntityType.PHONE:
             masked = self._generate_phone(original)
         elif entity_type == EntityType.EMAIL:
@@ -103,57 +103,17 @@ class PlaceholderGenerator:
                 base += "X" * (length - len(base))
             return base[:length]
     
-    def _generate_person_name(self, original: str) -> str:
-        """Generate fake Chinese name with same length.
-        
-        Algorithm ensures unique combinations for large numbers:
-        - Use counter to generate unique (surname_idx, name_chars) tuple
-        - For 2-char names: 8 surnames × 10 tiangan × 12 dizhi = 960 combinations
-        - For 3-char names: 8 × 10 × 12 = 960 combinations  
-        - For 4-char names: 8 × 10 × 12 × 10 = 9600 combinations
+    def _generate_person_placeholder(self, original: str) -> str:
+        """Generate an opaque placeholder for a person.
+
+        Fake names are easy to confuse with real people and have a small collision
+        space for short Chinese names. A typed token is clearer for downstream AI
+        and gives the vault a large unique namespace for reversible restoration.
         """
-        length = len(original)
         counter = self._counters[EntityType.PERSON]
         self._counters[EntityType.PERSON] += 1
-        
-        num_surnames = len(FAKE_SURNAMES)  # 8
-        num_tiangan = len(NAME_CHARS_TIANGAN)  # 10
-        num_dizhi = len(NAME_CHARS_DIZHI)  # 12
-        
-        # Use a unique decomposition: treat counter as a multi-base number
-        # This ensures no repeats until we exhaust all combinations
-        remaining = counter
-        
-        # First decompose for name characters (we need name_length chars)
-        name_length = length - 1
-        if name_length <= 0:
-            name_length = 1
-        
-        name_chars = []
-        for i in range(name_length):
-            if i == 0:
-                # First name char: use tiangan
-                char_list = NAME_CHARS_TIANGAN
-            else:
-                # Second name char: use dizhi
-                char_list = NAME_CHARS_DIZHI
-            char_idx = remaining % len(char_list)
-            name_chars.append(char_list[char_idx])
-            remaining //= len(char_list)
-        
-        # After exhausting name chars, use remaining for surname
-        surname_idx = remaining % num_surnames
-        surname = FAKE_SURNAMES[surname_idx]
-        
-        result = surname + "".join(name_chars)
-        
-        # Ensure same length (should already be correct)
-        if len(result) < length:
-            extra_idx = (counter // (num_tiangan * num_dizhi)) % num_dizhi
-            result += NAME_CHARS_DIZHI[extra_idx]
-        result = result[:length]
-        
-        return result
+
+        return f"{{{{PERSON_{counter + 1:06d}}}}}"
     
     def _generate_phone(self, original: str) -> str:
         """Generate masked phone number (length-preserving, separator-preserving, reversible)."""

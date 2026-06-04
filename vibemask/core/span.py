@@ -2,7 +2,7 @@
 Span data structure for representing detected entities.
 """
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import Enum
 from typing import Optional
 
@@ -21,6 +21,8 @@ class EntityType(Enum):
     ADDRESS = "ADDRESS"
     LOCATION = "LOCATION"  # Presidio standard
     URL = "URL"
+    ACCOUNT_NUMBER = "ACCOUNT_NUMBER"
+    SECRET = "SECRET"
     
     # Financial
     CREDIT_CARD = "CREDIT_CARD"
@@ -43,6 +45,7 @@ class SourceType(Enum):
     """Source of entity detection."""
     REGEX = "regex"
     SCHEMA = "schema"
+    PRIVACY_FILTER = "privacy_filter"
     HEURISTIC = "heuristic"
     LLM_JUDGE = "llm_judge"
     LLM_SCAN = "llm_scan"
@@ -52,6 +55,7 @@ class SourceType(Enum):
 SOURCE_PRIORITY = {
     SourceType.SCHEMA: 100,
     SourceType.REGEX: 90,
+    SourceType.PRIVACY_FILTER: 80,
     SourceType.LLM_JUDGE: 70,
     SourceType.LLM_SCAN: 60,
     SourceType.HEURISTIC: 50,
@@ -59,6 +63,8 @@ SOURCE_PRIORITY = {
 
 # Type priority for conflict resolution (higher = more specific)
 TYPE_PRIORITY = {
+    EntityType.SECRET: 110,
+    EntityType.ACCOUNT_NUMBER: 105,
     EntityType.PHONE: 100,
     EntityType.EMAIL: 100,
     EntityType.IDCN: 100,

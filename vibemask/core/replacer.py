@@ -3,7 +3,7 @@ Text replacement engine with reverse-order replacement to prevent offset drift.
 """
 
 from dataclasses import dataclass
-from typing import List, Dict, Tuple
+from typing import Any, List, Dict, Tuple
 from .span import Span
 
 
@@ -86,6 +86,37 @@ def create_replacements(
         mappings[masked] = span.text
     
     return replacements, mappings
+
+
+def apply_processor_replacements(
+    processor: Any,
+    text_replacements: Dict[str, str],
+    spans: List[Span] | None = None,
+) -> int:
+    """
+    Apply replacements to a document processor.
+
+    Span-based detections should be applied by offset when the processor can
+    support it. This preserves contextual model decisions for repeated text.
+    Processors without offset mapping fall back to string replacement.
+    """
+    if spans:
+        span_replacements = [
+            Replacement(
+                start=span.start,
+                end=span.end,
+                original=span.text,
+                masked=text_replacements[span.text],
+            )
+            for span in spans
+            if span.text in text_replacements
+        ]
+        try:
+            return processor.replace_spans(span_replacements)
+        except NotImplementedError:
+            pass
+
+    return processor.replace_text(text_replacements)
 
 
 def restore_text(masked_text: str, mappings: Dict[str, str]) -> str:

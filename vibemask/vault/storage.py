@@ -11,7 +11,7 @@ import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass
 
 
 @dataclass
@@ -87,9 +87,34 @@ class VaultStorage:
         
         # Ensure directory exists
         self.vault_path.parent.mkdir(parents=True, exist_ok=True)
+        self._ensure_private_permissions()
         
         # Initialize database
         self._init_db()
+        self._ensure_private_permissions()
+
+    def _ensure_private_permissions(self):
+        """Keep vault directories/files readable only by the current user."""
+        if os.name == "nt":
+            return
+
+        paths = [
+            get_vibemask_home(),
+            get_vibemask_home() / "projects",
+            self.vault_path.parent,
+        ]
+        for path in paths:
+            if path.exists():
+                try:
+                    path.chmod(0o700)
+                except OSError:
+                    pass
+
+        if self.vault_path.exists():
+            try:
+                self.vault_path.chmod(0o600)
+            except OSError:
+                pass
     
     def _init_db(self):
         """Initialize database schema."""
@@ -127,6 +152,7 @@ class VaultStorage:
         # Indexes
         conn.execute('CREATE INDEX IF NOT EXISTS idx_mappings_project ON mappings(project_id)')
         conn.execute('CREATE INDEX IF NOT EXISTS idx_mappings_original ON mappings(original_text, entity_type)')
+        conn.execute('CREATE INDEX IF NOT EXISTS idx_mappings_masked ON mappings(project_id, masked_text)')
         conn.execute('CREATE INDEX IF NOT EXISTS idx_sessions_project ON sessions(project_id)')
         
         conn.commit()
@@ -183,10 +209,21 @@ class VaultStorage:
             # CJK-friendly tweak for names/addresses.
             cjk_positions = [i for i, ch in enumerate(chars) if "\u4e00" <= ch <= "\u9fff"]
             if cjk_positions:
-                pool = list("甲乙丙丁戊己庚辛壬癸子丑寅卯辰巳午未申酉戌亥")
-                k = min(2, len(cjk_positions))
-                for j in range(k):
-                    chars[cjk_positions[-1 - j]] = pool[(attempt + j) % len(pool)]
+                pool = list(
+                    "甲乙丙丁戊己庚辛壬癸子丑寅卯辰巳午未申酉戌亥"
+                    "天地玄黄宇宙洪荒日月星辰春夏秋冬东南西北"
+                    "壹贰叁肆伍陆柒捌玖零"
+                )
+                n = attempt
+                for pos in reversed(cjk_positions):
+                    chars[pos] = pool[n % len(pool)]
+                    n //= len(pool)
+
+                # For very collision-heavy legacy vaults, keep expanding within
+                # the CJK block instead of cycling through the small friendly pool.
+                if n:
+                    for j, pos in enumerate(reversed(cjk_positions), start=1):
+                        chars[pos] = chr(0x4E00 + ((attempt // j) % 20_902))
                 return "".join(chars)
 
             # Generic: overwrite last chars with base36 counter.
