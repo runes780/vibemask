@@ -129,14 +129,15 @@ class HybridDetector:
         if not context_spans:
             context_spans = privacy_context.detect_docx_table_context(processor, privacy_detector)
         flat_spans = privacy_detector.detect(text)
-        # Suppress model spans that land in an explicitly non-personal column
-        # (e.g. 职位代码 values the model mis-flags as ACCOUNT_NUMBER). Structural
-        # column knowledge vetoes these unreliable model detections on tables.
-        non_pii_ranges = privacy_context.detect_non_pii_ranges(processor)
-        if non_pii_ranges:
+        # The model's flat-text pass should not re-process table cells that
+        # structural detection owns — it only adds false positives there
+        # (position codes, run-fragmentation). The model already saw the table
+        # via the reconstructed context above; here it only handles narrative.
+        table_cell_ranges = privacy_context.detect_table_cell_ranges(processor)
+        if table_cell_ranges:
             flat_spans = [
                 s for s in flat_spans
-                if not any(r0 <= s.start < r1 or r0 < s.end <= r1 for r0, r1 in non_pii_ranges)
+                if not any(r0 <= s.start < r1 or r0 < s.end <= r1 for r0, r1 in table_cell_ranges)
             ]
         return (context_spans or []) + flat_spans
 

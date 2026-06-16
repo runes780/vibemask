@@ -81,21 +81,6 @@ def _header_type(header: str) -> str | None:
     return None
 
 
-# Column headers whose values are explicitly NOT personal data. Used to suppress
-# model false positives — e.g. a 职位代码 value (10806202657001) the model flags
-# as ACCOUNT_NUMBER. Only numeric *code* columns are listed (text columns like
-# 拟录用职位 / 职位名称 hold job descriptions, not PII, and broad 职位/岗位
-# matches would over-suppress legitimate detections landing in those cells).
-_NON_PII_LABELS = (
-    "职位代码", "岗位代码", "职务代码", "招考职位代码", "职位编号", "岗位编号",
-    "职位序号", "岗位序号", "招考岗位代码",
-)
-
-
-def _is_non_pii_header(header: str) -> bool:
-    h = _normalize_header(header)
-    return any(k in h for k in _NON_PII_LABELS)
-
 
 
 def _structural_spans_from_mappings(mappings: list[ContextValueMap]) -> list[Span]:
@@ -194,16 +179,18 @@ def _group_docx_rows(segments: list[Any]) -> dict[tuple[str, str], dict[int, dic
     return rows
 
 
-def detect_non_pii_ranges(processor: Any) -> list[tuple[int, int]]:
-    """Return ``[(start_offset, end_offset), ...]`` for every value cell in an
-    explicitly non-personal column (职位代码 / 岗位代码 / ...). The caller uses
-    these to suppress model spans (e.g. a position code the model mis-flags as
-    ACCOUNT_NUMBER) — the column header declares the value non-personal."""
+def detect_table_cell_ranges(processor: Any) -> list[tuple[int, int]]:
+    """Offset ranges of every data cell in a table that structural detection
+    owns (a table whose header row carries a privacy hint). The model's
+    flat-text pass should skip these cells — structural detection (plus the
+    model-on-reconstructed-context run inside detect_*_row_context) already
+    covers them, and the flat pass on table cells only adds false positives
+    (position codes, run-fragmentation). The model still runs on narrative
+    text outside tables."""
     suffix = getattr(getattr(processor, "file_path", None), "suffix", "").lower()
     segments = list(getattr(processor, "_segments", []) or [])
     if suffix == ".xlsx":
         grouped = _group_xlsx_rows(segments)  # {(part, row): {col: cell}}
-        # rebuild as tables[part][row] = {col: cell}
         tables: dict[Any, dict[int, Any]] = {}
         for (part, row), cells in grouped.items():
             tables.setdefault(part, {})[row] = cells
@@ -218,16 +205,10 @@ def detect_non_pii_ranges(processor: Any) -> list[tuple[int, int]]:
     for table_rows in tables.values():
         header_row = find_header(table_rows)
         if header_row is None:
-            continue
-        headers = {
-            col: _normalize_header(cell.text)
-            for col, cell in table_rows[header_row].items()
-            if getattr(cell, "text", "").strip()
-        }
-        for row in sorted(r for r in table_rows if r > header_row):
-            for col, cell in table_rows[row].items():
-                header = headers.get(col)
-                if header and _is_non_pii_header(header) and getattr(cell, "text", "").strip():
+            continue  # structural didn't own this table — leave it to the model
+        for row in sorted(r for r in table_rows if r != header_row):
+            for cell in table_rows[row].values():
+                if getattr(cell, "text", "").strip():
                     ranges.append((cell.start_offset, cell.end_offset))
     return ranges
 
