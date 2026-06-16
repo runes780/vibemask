@@ -65,6 +65,8 @@ NON_PERSON_WORDS = frozenset({
     "机构", "组织", "体系", "系统", "平台",
     # education / institution descriptors common in gov/edu docs
     "民办", "公办", "校办", "国办", "办学", "办学规模", "在校生", "教职工", "教职工数",
+    # date-ish short words the model mis-flags as PERSON
+    "年月", "月日", "年份", "季度", "学期",
 })
 
 
@@ -128,6 +130,12 @@ _DROP = object()
 def refine_privacy_filter_spans(spans: list[Span], text: str) -> list[Span]:
     refined: list[Span] = []
     for span in spans:
+        # A PII value should never span a line/paragraph break — trim there so
+        # the span stays replaceable (OOXML replacement is per-paragraph) and
+        # we drop trailing narrative like "大厦\n邮政编码：310023".
+        new = _trim_at_newline(span, text)
+        if new is not None:
+            span = new
         new = _refine_private_date_overreach(span, text)
         if new is not None:
             span = new
@@ -141,6 +149,27 @@ def refine_privacy_filter_spans(spans: list[Span], text: str) -> list[Span]:
             span = ident
         refined.append(span)
     return refined
+
+
+def _trim_at_newline(span: Span, text: str) -> Span | None:
+    nl = span.text.find("\n")
+    if nl < 0:
+        nl = span.text.find("\r")
+    if nl <= 0:  # nothing before the newline, or no newline
+        return None
+    new_text = span.text[:nl]
+    new_end = span.start + len(new_text)
+    if text[span.start:new_end] != new_text:
+        return None
+    return Span(
+        start=span.start,
+        end=new_end,
+        text=new_text,
+        type=span.type,
+        source=span.source,
+        confidence=span.confidence,
+        reason=(span.reason or "") + "+nl_trim",
+    )
 
 
 def _refine_identifier_label(span: Span, text: str):

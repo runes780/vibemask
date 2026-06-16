@@ -122,13 +122,14 @@ class HybridDetector:
         # Structured tables (XLSX cells / DOCX table cells) get reconstructed as
         # "header: value" pairs so headers act as labels and the model sees the
         # column type for each value. Falls back to flat-text detection when the
-        # document has no recognized tabular structure.
+        # Table context gives precise column-based spans; the flat-text pass
+        # below catches narrative PII that lives outside tables (e.g. a
+        # 监督电话 in a paragraph). Both are returned — merge_spans dedups.
         context_spans = privacy_context.detect_xlsx_row_context(processor, privacy_detector)
         if not context_spans:
             context_spans = privacy_context.detect_docx_table_context(processor, privacy_detector)
-        if context_spans:
-            return context_spans
-        return privacy_detector.detect(text)
+        flat_spans = privacy_detector.detect(text)
+        return (context_spans or []) + flat_spans
 
     def _detect_chinese_names(self, text: str) -> list[Span]:
         smart_detector = import_module("vibemask.detector.smart_detector")

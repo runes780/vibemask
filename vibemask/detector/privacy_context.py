@@ -66,8 +66,14 @@ HEADER_TYPE_MAP: dict[str, str] = {
 }
 
 
+def _normalize_header(text: str) -> str:
+    """Collapse whitespace so ``姓 名`` matches ``姓名`` (LibreOffice/Word often
+    insert spaces inside CJK headers)."""
+    return "".join(text.split())
+
+
 def _header_type(header: str) -> str | None:
-    h = header.strip()
+    h = _normalize_header(header)
     hl = h.lower()
     for keyword, etype in HEADER_TYPE_MAP.items():
         if keyword in h or keyword in hl:
@@ -76,13 +82,18 @@ def _header_type(header: str) -> str | None:
 
 
 def _structural_spans_from_mappings(mappings: list[ContextValueMap]) -> list[Span]:
-    """One span per labelled-column value — typed by its header. These fill the
-    recall gap where the model fails to flag a value the column header already
-    declares as PII (e.g. every cell under 学号)."""
+    """One span per labelled-column value — typed by its header — but ONLY when
+    the value's format matches the claimed type. This fills the model's recall
+    gap on identifiers (学号/工号/准考证号/手机/邮箱/身份证/URL) without emitting
+    garbage on messy tables: PERSON/ADDRESS/ORG are too ambiguous to trust
+    structurally (a 4-CJK cell could be a name or a label like 工作单位), so they
+    are left to the heuristic/model layers."""
     spans: list[Span] = []
     for m in mappings:
         etype = _header_type(m.header)
-        if etype is None or not m.original_text.strip():
+        if etype is None:
+            continue
+        if not _value_matches_type(m.original_text, etype):
             continue
         try:
             entity = EntityType[etype]
@@ -100,6 +111,56 @@ def _structural_spans_from_mappings(mappings: list[ContextValueMap]) -> list[Spa
             )
         )
     return spans
+
+
+# Format validators: a structural span is only emitted when the cell value
+# actually looks like the type its header claims. Keeps real identifiers, drops
+# 序号 (1,2,3), header labels leaked into data, and other table noise.
+_VALUE_PATTERNS: dict[str, "re.Pattern"] = {
+    "PHONE": re.compile(r"^[\d][\d\-+ ]{6,}$"),
+    "EMAIL": re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$"),
+    "IDCN": re.compile(r"^\d{15}$|^\d{17}[\dXx]$"),
+    "ACCOUNT_NUMBER": re.compile(r"^[A-Za-z0-9]{4,}$"),
+    "URL": re.compile(r"^(https?://|www\.|[\w-]+\.[\w-]+)"),
+}
+# Types we never emit structurally (too ambiguous — left to model/heuristic).
+_STRUCTURAL_SKIP_TYPES = {"ADDRESS", "ORG", "DATE_TIME"}
+
+
+def _value_matches_type(value: str, etype: str) -> bool:
+    v = value.strip()
+    if not v:
+        return False
+    if etype == "PERSON":
+        return _is_plausible_name(v)
+    if etype in _STRUCTURAL_SKIP_TYPES:
+        return False
+    pat = _VALUE_PATTERNS.get(etype)
+    return bool(pat.match(v)) if pat is not None else True
+
+
+def _is_plausible_name(value: str) -> bool:
+    """A 姓名-column cell: trust the header (high recall — the column IS names)
+    but reject obvious header labels that leaked into data rows. Real names are
+    2-4 CJK chars and never contain label suffixes like 单位/学校/情况/称号."""
+    v = value.strip()
+    if not (2 <= len(v) <= 4) or not all("一" <= c <= "鿿" for c in v):
+        return False
+    from .privacy_postprocess import is_false_person, is_field_label
+
+    if is_field_label(v) or is_false_person(v):
+        return False
+    if any(suf in v for suf in _LABEL_SUFFIXES):
+        return False
+    return True
+
+
+# Suffixes that mark a cell as a field label / descriptor, never a person name.
+_LABEL_SUFFIXES = (
+    "单位", "学校", "情况", "类别", "时间", "称号", "职称", "年限", "代码",
+    "业务", "项目", "范围", "内容", "说明", "学科", "教学", "机构", "部门",
+    "名称", "事项", "指标", "金额", "日期", "年度", "月份",
+)
 
 
 def detect_xlsx_row_context(processor: Any, privacy_detector: Any) -> list[Span]:
@@ -148,7 +209,7 @@ def _build_row_context(rows: dict[tuple[str, int], dict[str, Any]]) -> tuple[str
             continue
 
         headers = {
-            col: cell.text.strip()
+            col: _normalize_header(cell.text)
             for col, cell in part_rows[header_row].items()
             if getattr(cell, "text", "").strip()
         }
@@ -167,7 +228,7 @@ def _build_row_context(rows: dict[tuple[str, int], dict[str, Any]]) -> tuple[str
                 prefix = f"{header}: "
                 value_start = sum(len(part) for part in parts_for_line) + len(prefix)
                 parts_for_line.append(prefix + value)
-                if header in PRIVACY_HEADER_HINTS or any(hint in header for hint in PRIVACY_HEADER_HINTS):
+                if header in PRIVACY_HEADER_HINTS or any(hint in header for hint in PRIVACY_HEADER_HINTS) or _header_type(header) is not None:
                     pending_mappings.append((value_start, cells[col], value, header))
                 parts_for_line.append(" | ")
             if parts_for_line:
@@ -201,7 +262,16 @@ def _find_header_row(rows: dict[int, dict[str, Any]]) -> int | None:
 
 
 def _has_privacy_header(values) -> bool:
-    return any(value in PRIVACY_HEADER_HINTS or any(hint in value for hint in PRIVACY_HEADER_HINTS) for value in values)
+    # A column is a PII column if its header matches a known privacy hint OR
+    # maps to an entity type (covers 准考证号/工号/客户编号 which are PII columns
+    # but not in the legacy hint set). Headers are whitespace-normalized.
+    for value in values:
+        nv = _normalize_header(value)
+        if nv in PRIVACY_HEADER_HINTS or any(hint in nv for hint in PRIVACY_HEADER_HINTS):
+            return True
+        if _header_type(value) is not None:
+            return True
+    return False
 
 
 def _find_value_mapping(span: Span, mappings: list[ContextValueMap]) -> ContextValueMap | None:
@@ -283,7 +353,7 @@ def _build_docx_row_context(
         if header_row is None:
             continue
         headers = {
-            col: cell.text.strip()
+            col: _normalize_header(cell.text)
             for col, cell in table_rows[header_row].items()
             if getattr(cell, "text", "").strip()
         }
@@ -302,7 +372,7 @@ def _build_docx_row_context(
                 prefix = f"{header}: "
                 value_start = sum(len(part) for part in parts_for_line) + len(prefix)
                 parts_for_line.append(prefix + value)
-                if header in PRIVACY_HEADER_HINTS or any(hint in header for hint in PRIVACY_HEADER_HINTS):
+                if header in PRIVACY_HEADER_HINTS or any(hint in header for hint in PRIVACY_HEADER_HINTS) or _header_type(header) is not None:
                     pending_mappings.append((value_start, cells[col], value, header))
                 parts_for_line.append(" | ")
             if parts_for_line:
