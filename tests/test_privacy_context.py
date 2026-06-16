@@ -35,17 +35,16 @@ def test_xlsx_row_context_maps_privacy_filter_span_back_to_original_cell():
 
     spans = detect_xlsx_row_context(processor, FakeDetector())
 
-    assert spans == [
-        Span(
-            start=11,
-            end=14,
-            text="杨嘉明",
-            type=EntityType.PERSON,
-            source=SourceType.PRIVACY_FILTER,
-            confidence=1.0,
-            reason="privacy_filter:private_person+row_context",
-        )
-    ]
+    # The model span is mapped back to the original cell offset (11:14)...
+    model_spans = [s for s in spans if s.source == SourceType.PRIVACY_FILTER]
+    assert len(model_spans) == 1
+    assert (model_spans[0].start, model_spans[0].end, model_spans[0].text) == (11, 14, "杨嘉明")
+    # ...and a structural span is also emitted (column 姓名 -> PERSON), filling
+    # any model recall gap. Both share the value's offset.
+    assert any(
+        s.source == SourceType.SCHEMA and s.text == "杨嘉明" and s.type == EntityType.PERSON
+        for s in spans
+    )
 
 
 def test_xlsx_row_context_does_not_emit_header_spans():
@@ -107,7 +106,8 @@ def test_xlsx_row_context_maps_multiple_rows():
 
     spans = detect_xlsx_row_context(processor, FakeDetector())
 
-    assert [(span.start, span.end, span.text) for span in spans] == [
-        (6, 9, "杨嘉明"),
-        (14, 17, "刘重肖"),
-    ]
+    # Model-mapped spans + structural spans are both emitted (the structural
+    # ones dedup with the model ones downstream in merge_spans). Check that both
+    # values are covered at their original offsets, deduplicated by position.
+    got = {(span.start, span.end, span.text) for span in spans}
+    assert got == {(6, 9, "杨嘉明"), (14, 17, "刘重肖")}
