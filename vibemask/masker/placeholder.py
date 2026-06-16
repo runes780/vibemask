@@ -1,304 +1,114 @@
 """
 Placeholder generator for masking sensitive data.
-Generates unique, natural-looking replacements.
+
+Produces **type-preserving, LLM-legible** surrogate tokens so that downstream
+models can tell what kind of field each mask stands for (and process it
+accordingly) instead of discarding it as noise.
+
+Token format
+------------
+``{{<TYPE>_<NNNNNN>:<shape>}}``
+
+* ``TYPE``      — the entity type (PHONE, EMAIL, IDCN, SECRET, …). Names and
+  organizations carry no useful shape, so they use ``{{PERSON_000001}}`` with no
+  ``:shape`` suffix.
+* ``NNNNNN``    — a per-type counter, guaranteeing uniqueness across entities of
+  the same type. Final uniqueness/stability is still enforced by the vault.
+* ``shape``     — a **fully redacted** structural template of the original
+  (digit -> ``#``, ASCII letter -> ``X``, CJK -> ``某``; separators such as
+  ``- @ . / :`` are kept because they are structural, not identifying). No
+  original character survives, so the shape leaks nothing — it only tells the
+  downstream LLM "this is a phone-shaped value" / "an 18-digit ID" / etc.
+
+The whole token string is the vault key, so masking is losslessly reversible:
+``{{PHONE_000001:###########}}`` -> original phone.
 """
 
 from typing import Dict
 from ..core.span import EntityType
 
 
-# ============================================================
-# Chinese Name Generation
-# ============================================================
+# Types whose mask carries no shape suffix (names/orgs have no meaningful shape,
+# and the bare ``{{PERSON_000001}}`` form is depended on by the exec wrapper and
+# several tests).
+_NO_SHAPE_TYPES = {"PERSON", "ORG"}
 
-# Surnames for fake names (避开常用真实姓氏)
-FAKE_SURNAMES = ["邢", "钱", "徐", "李", "宋", "崔", "荣", "赵"]
+# Friendlier token names for some EntityType values.
+_TYPE_ALIASES = {
+    "DATE_TIME": "DATE",
+    "ACCOUNT_NUMBER": "ACCOUNT",
+    "CREDIT_CARD": "CARD",
+}
 
-# Name characters (天干地支 - looks natural, unique combinations)
-NAME_CHARS_TIANGAN = ["甲", "乙", "丙", "丁", "戊", "己", "庚", "辛", "壬", "癸"]
-NAME_CHARS_DIZHI = ["子", "丑", "寅", "卯", "辰", "巳", "午", "未", "申", "酉", "戌", "亥"]
+_SHAPE_CAP = 32  # cap shape length so addresses/long secrets don't bloat the token
 
 
 class PlaceholderGenerator:
+    """Generates unique, stable, type-preserving placeholders.
+
+    Design:
+    1. Same (original, type) -> same token (stable within a run; the vault
+       enforces cross-run stability and resolves collisions).
+    2. Every token names its type so a downstream LLM knows the field kind.
+    3. Structured types also carry a redacted shape; the original never leaks.
     """
-    Generates unique, stable placeholders for sensitive entities.
-    
-    Design principles:
-    1. Same original -> same placeholder (stable within project)
-    2. Structured types keep useful format where possible
-    3. Person names use opaque typed placeholders to avoid fake real identities
-    """
-    
-    def __init__(self):
-        self._counters: Dict[EntityType, int] = {t: 0 for t in EntityType}
-        self._cache: Dict[tuple, str] = {}  # (original, type) -> masked
-    
+
+    def __init__(self) -> None:
+        self._counters: Dict[str, int] = {}
+        self._cache: Dict[tuple, str] = {}
+
     def generate(self, original: str, entity_type: EntityType) -> str:
-        """
-        Generate a placeholder for the given entity.
-        
-        Args:
-            original: Original sensitive text
-            entity_type: Type of entity
-            
-        Returns:
-            Masked placeholder text
-        """
+        """Return the surrogate token for ``original`` of type ``entity_type``."""
         cache_key = (original, entity_type)
-        if cache_key in self._cache:
-            return self._cache[cache_key]
-        
-        if entity_type == EntityType.PERSON:
-            masked = self._generate_person_placeholder(original)
-        elif entity_type == EntityType.PHONE:
-            masked = self._generate_phone(original)
-        elif entity_type == EntityType.EMAIL:
-            masked = self._generate_email(original)
-        elif entity_type == EntityType.IDCN:
-            masked = self._generate_idcn(original)
-        elif entity_type == EntityType.ORG:
-            masked = self._generate_org(original)
-        elif entity_type == EntityType.ADDRESS:
-            masked = self._generate_address(original)
-        elif entity_type == EntityType.URL:
-            masked = self._generate_url(original)
-        elif entity_type == EntityType.DATE_TIME:
-            masked = self._generate_date_time(original)
+        cached = self._cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        type_name = _token_type_name(entity_type)
+        n = self._counters.get(type_name, 0) + 1
+        self._counters[type_name] = n
+
+        if type_name in _NO_SHAPE_TYPES:
+            token = f"{{{{{type_name}_{n:06d}}}}}"
         else:
-            masked = self._generate_generic(original, entity_type)
-        
-        self._cache[cache_key] = masked
-        return masked
-    
-    def _generate_url(self, original: str) -> str:
-        """Generate length-preserving masked URL."""
-        import re
-        counter = self._counters[EntityType.URL]
-        self._counters[EntityType.URL] += 1
-        
-        length = len(original)
-        
-        # Try to preserve domain but mask the path with length-preserving placeholder
-        match = re.match(r'(https?://[^/]+)(.*)', original)
-        if match:
-            domain = match.group(1)
-            path = match.group(2)
-            path_len = len(path)
-            
-            if path_len > 0:
-                # Create a length-preserving path replacement
-                # Format: /U{counter} padded with 'X' to match length
-                base_path = f"/U{counter:03d}"
-                if len(base_path) < path_len:
-                    base_path += "X" * (path_len - len(base_path))
-                elif len(base_path) > path_len:
-                    base_path = base_path[:path_len]
-                return domain + base_path
-            else:
-                return domain
-        else:
-            # Fallback: create length-preserving generic URL
-            base = f"https://example.com/U{counter:03d}"
-            if len(base) < length:
-                base += "X" * (length - len(base))
-            return base[:length]
-    
-    def _generate_person_placeholder(self, original: str) -> str:
-        """Generate an opaque placeholder for a person.
+            shape = _redact_shape(original)
+            token = f"{{{{{type_name}_{n:06d}:{shape}}}}}" if shape else f"{{{{{type_name}_{n:06d}}}}}"
 
-        Fake names are easy to confuse with real people and have a small collision
-        space for short Chinese names. A typed token is clearer for downstream AI
-        and gives the vault a large unique namespace for reversible restoration.
-        """
-        counter = self._counters[EntityType.PERSON]
-        self._counters[EntityType.PERSON] += 1
+        self._cache[cache_key] = token
+        return token
 
-        return f"{{{{PERSON_{counter + 1:06d}}}}}"
-    
-    def _generate_phone(self, original: str) -> str:
-        """Generate masked phone number (length-preserving, separator-preserving, reversible)."""
-        digits_only = "".join(c for c in original if c.isdigit())
-        if not digits_only:
-            return original
-
-        counter = self._counters[EntityType.PHONE]
-        self._counters[EntityType.PHONE] += 1
-
-        # Generate a pseudo phone number with the same digit count.
-        digit_count = len(digits_only)
-        if digit_count == 11:
-            # Make it look like a CN mobile number (1[3-9]xxxxxxxxx) without leaking the original.
-            second = str(3 + (counter % 7))  # 3-9
-            rest = f"{(counter // 7) % 1_000_000_000:09d}"
-            masked_digits = "1" + second + rest
-        else:
-            # Fallback for other phone-like strings (landlines, extensions, etc.).
-            masked_digits = f"{counter:0{digit_count}d}"[-digit_count:]
-
-        # Preserve separators by replacing digits in-place.
-        out = []
-        i = 0
-        for ch in original:
-            if ch.isdigit():
-                out.append(masked_digits[i])
-                i += 1
-            else:
-                out.append(ch)
-        return "".join(out)
-    
-    def _generate_email(self, original: str) -> str:
-        """Generate masked email (keep domain structure)."""
-        if '@' not in original:
-            return original
-        
-        local, domain = original.rsplit('@', 1)
-        counter = self._counters[EntityType.EMAIL]
-        self._counters[EntityType.EMAIL] += 1
-        
-        # Generate unique local part with similar length
-        new_local = f"u{counter:03d}"
-        
-        # Pad to match original length if needed
-        while len(new_local) < len(local):
-            new_local += "x"
-        new_local = new_local[:len(local)]
-        
-        return f"{new_local}@{domain}"
-    
-    def _generate_idcn(self, original: str) -> str:
-        """Generate pseudo Chinese ID card number (length-preserving, reversible)."""
-        counter = self._counters[EntityType.IDCN]
-        self._counters[EntityType.IDCN] += 1
-
-        def calc_check_digit(base17: str) -> str:
-            weights = [7, 9, 10, 5, 8, 4, 2, 1, 6, 3, 7, 9, 10, 5, 8, 4, 2]
-            check_chars = "10X98765432"
-            total = sum(int(base17[i]) * weights[i] for i in range(17))
-            return check_chars[total % 11]
-
-        if len(original) == 18 and original[:-1].isdigit():
-            # Use a fixed (non-real) region code and synthesize date/sequence.
-            region = "110101"
-            year = 1980 + ((counter // 366) % 30)
-            day_of_year = (counter % 366) + 1
-            month = (day_of_year - 1) // 31 + 1
-            day = (day_of_year - 1) % 31 + 1
-            seq = counter % 1000
-            base17 = f"{region}{year:04d}{month:02d}{day:02d}{seq:03d}"
-            check = calc_check_digit(base17)
-            return base17 + check
-
-        # Fallback: keep length and character class roughly similar.
-        if original.isdigit():
-            return f"{counter:0{len(original)}d}"[-len(original):]
-        # Preserve last char case if X/x.
-        if len(original) == 18 and original[-1] in {"X", "x"}:
-            base = f"{counter:017d}"[-17:]
-            check = calc_check_digit(base)
-            return base + (check.lower() if original[-1] == "x" else check)
-        return self._generate_generic(original, EntityType.IDCN)
-    
-    def _generate_org(self, original: str) -> str:
-        """Generate masked organization name."""
-        counter = self._counters[EntityType.ORG]
-        self._counters[EntityType.ORG] += 1
-        
-        # Use length-preserving format
-        length = len(original)
-        base = f"组织{counter:02d}"
-        
-        # Pad or truncate
-        if len(base) < length:
-            base += "X" * (length - len(base))
-        return base[:length]
-    
-    def _generate_address(self, original: str) -> str:
-        """Generate masked address."""
-        counter = self._counters[EntityType.ADDRESS]
-        self._counters[EntityType.ADDRESS] += 1
-        
-        length = len(original)
-        # Preserve length and rough character classes to avoid breaking layouts.
-        # (Exact restoration uses vault/session mappings.)
-        out = []
-        for ch in original:
-            if "\u4e00" <= ch <= "\u9fff":
-                out.append("某")
-            elif ch.isdigit():
-                out.append("0")
-            elif ch.isalpha():
-                out.append("X")
-            else:
-                out.append(ch)
-
-        result = "".join(out)
-        # Ensure uniqueness-friendly variation by tweaking digit positions first.
-        chars = list(result)
-        digit_positions = [i for i, ch in enumerate(chars) if ch.isdigit()]
-        suffix = f"{counter:04d}"
-        if digit_positions:
-            k = min(4, len(digit_positions))
-            for j in range(k):
-                chars[digit_positions[-k + j]] = suffix[-k + j]
-        return "".join(chars)[:length]
-
-    def _generate_date_time(self, original: str) -> str:
-        """Generate masked date/time string while preserving separators."""
-        counter = self._counters[EntityType.DATE_TIME]
-        self._counters[EntityType.DATE_TIME] += 1
-
-        digits = [c for c in original if c.isdigit()]
-        if not digits:
-            return self._generate_generic(original, EntityType.DATE_TIME)
-
-        seed = f"{counter:0{len(digits)}d}"[-len(digits):]
-        out = []
-        di = 0
-        for ch in original:
-            if ch.isdigit():
-                out.append(seed[di])
-                di += 1
-            else:
-                out.append(ch)
-        return "".join(out)
-    
-    def _generate_generic(self, original: str, entity_type: EntityType) -> str:
-        """Generate generic placeholder (length-preserving, unique per type)."""
-        counter = self._counters[entity_type]
-        self._counters[entity_type] += 1
-
-        length = len(original)
-        if length <= 0:
-            return original
-
-        # Prefer digits-only masks for numeric strings.
-        if original.isdigit():
-            return f"{counter:0{length}d}"[-length:]
-
-        # Base36 counter to fit short strings.
-        alphabet = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
-
-        def to_base36(n: int) -> str:
-            if n == 0:
-                return "0"
-            chars = []
-            while n > 0:
-                n, r = divmod(n, 36)
-                chars.append(alphabet[r])
-            return "".join(reversed(chars))
-
-        suffix = to_base36(counter)
-        if len(suffix) > length:
-            suffix = suffix[-length:]
-
-        pad_char = "＊"  # fullwidth asterisk, more CJK-friendly
-        return (pad_char * (length - len(suffix))) + suffix
-    
     def get_reverse_mappings(self) -> Dict[str, str]:
-        """Get reverse mappings {masked -> original} for restoration."""
+        """Return ``{masked -> original}`` for everything generated so far."""
         return {v: k[0] for k, v in self._cache.items()}
-    
-    def clear_cache(self):
-        """Clear the cache (start fresh)."""
+
+    def clear_cache(self) -> None:
+        """Reset counters and cache (start fresh)."""
         self._cache.clear()
-        self._counters = {t: 0 for t in EntityType}
+        self._counters = {}
+
+
+def _token_type_name(entity_type: EntityType) -> str:
+    return _TYPE_ALIASES.get(entity_type.value, entity_type.value)
+
+
+def _redact_shape(text: str) -> str:
+    """Build a fully-redacted structural template of ``text``.
+
+    Digits -> ``#``, ASCII letters -> ``X``, CJK -> ``某``. Separators and
+    punctuation are preserved (structural, non-identifying). No original
+    character survives. Capped at ``_SHAPE_CAP`` chars.
+    """
+    out = []
+    for ch in text:
+        if ch.isdigit():
+            out.append("#")
+        elif ch.isascii() and ch.isalpha():
+            out.append("X")
+        elif "一" <= ch <= "鿿":
+            out.append("某")
+        else:
+            out.append(ch)
+    shape = "".join(out)
+    if len(shape) > _SHAPE_CAP:
+        shape = shape[: _SHAPE_CAP - 1] + "…"
+    return shape

@@ -93,3 +93,7 @@ tests/*_restored.*
 # Config with secrets
 .vibemask.yaml
 !.vibemask.yaml.example
+
+# Eval: generated artifacts (regenerable from eval/golden.py + eval/runner.py)
+eval/golden/all.jsonl
+eval/reports/*.json

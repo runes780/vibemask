@@ -31,4 +31,4 @@ def test_hybrid_detector_caches_mlx_privacy_detector(monkeypatch):
     detector.detect("Alice")
     detector.detect("Bob")
 
-    assert created == [{"checkpoint": "/tmp/mlx-model"}]
+    assert created == [{"checkpoint": "/tmp/mlx-model", "decode_mode": "viterbi"}]

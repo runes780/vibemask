@@ -176,15 +176,32 @@ original = vault.get_mapping_by_masked(masked)  # Returns "张三"
 
 ## 📊 Supported PII Types
 
-| Type | Example | Masked | Format Strategy |
-|------|---------|--------|------------------|
-| 姓名 (PERSON) | 张三 | {{PERSON_000001}} | Typed opaque token |
-| 电话 (PHONE) | 138-1234-5678 | 130-0000-0000 | Separator-preserving |
-| 邮箱 (EMAIL) | test@example.com | u001@example.com | Domain-preserving |
-| 身份证 (IDCN) | 110101198801011234 | 110101198001010002 | Length-preserving |
-| 地址 (ADDRESS) | 北京市朝阳区xxx路123号 | 某某某某某某XXX某000某 | Length-aware |
-| 日期 (DATE) | 2024-01-15 | 0000-00-00 | Format-preserving |
-| URL | https://example.com/user | https://example.com/U001 | URL-shaped |
+Every mask is a **type-preserving token** so a downstream LLM knows what field it
+stands for (and processes it accordingly) instead of discarding it as noise:
+
+```
+{{<TYPE>_<NNNNNN>:<shape>}}
+```
+
+`TYPE` names the field; `shape` is a **fully redacted** template of the original
+(digit → `#`, ASCII letter → `X`, CJK → `某`; separators kept). No original
+character survives, yet the shape tells the LLM "this is a phone / an 18-digit
+ID / …". The whole token is the vault key, so masking is losslessly reversible.
+Names/organizations carry no useful shape, so they use a bare typed token.
+
+| Type | Example | Masked |
+|------|---------|--------|
+| 姓名 (PERSON) | 张三 | `{{PERSON_000001}}` |
+| 电话 (PHONE) | 138-1234-5678 | `{{PHONE_000001:###-####-####}}` |
+| 邮箱 (EMAIL) | test@example.com | `{{EMAIL_000001:XXXX@XXXXXXX.XXX}}` |
+| 身份证 (IDCN) | 110101198801011234 | `{{IDCN_000001:##################}}` |
+| 地址 (ADDRESS) | 北京市朝阳区xxx路123号 | `{{ADDRESS_000001:某某某某某某XXX某###某}}` |
+| 日期 (DATE) | 2024-01-15 | `{{DATE_000001:####-##-##}}` |
+| URL | https://example.com/user | `{{URL_000001:XXXXX://XXXXXXX.XXX/XXXX}}` |
+
+**Identifier policy**: personal identifiers — 工号/学号/准考证号/客户编号/会员号/卡号/病历号 —
+are masked (the label word stays in the text, e.g. `工号 {{ACCOUNT_001:X######}}`).
+Transaction references — 订单号/合同号/发票号/流水号 — are not personal data and are dropped.
 
 ## 🏗 Architecture
 
@@ -204,7 +221,7 @@ vibemask/
 │   ├── presidio_engine.py  # Rule-based detection (Presidio)
 │   └── smart_detector.py   # Chinese name detection (Jieba + spaCy)
 ├── masker/
-│   └── placeholder.py      # Length-preserving placeholder generation
+│   └── placeholder.py      # Type-preserving {{TYPE:shape}} placeholders
 ├── vault/
 │   └── storage.py          # SQLite vault for mapping persistence
 ├── restore/
@@ -214,6 +231,27 @@ vibemask/
 │   └── server.py           # Web server
 └── cli.py                  # CLI interface (Typer)
 ```
+
+```
+eval/                      # Detection accuracy harness (golden dataset + P/R/F1)
+├── metrics.py             # Per-type Precision/Recall/F1 + FP/FN detail
+├── golden.py              # Golden dataset (substring-annotated, offset-validated)
+└── runner.py              # `python -m eval.runner --engine hybrid`
+```
+
+### Accuracy
+
+Detection accuracy is measured against a golden dataset and tracked in
+[`eval/reports/BASELINE.md`](eval/reports/BASELINE.md). Current hybrid (MLX
+Privacy Filter + deterministic layers) on the golden set:
+
+| | Precision | Recall | F1 |
+|---|---:|---:|---:|
+| hybrid | 84.7% | 96.2% | 90.1% |
+| deterministic (no model) | 89.5% | 73.9% | 81.0% |
+
+Run it yourself: `HF_HUB_OFFLINE=1 python -m eval.runner --engine hybrid`
+(model cached locally; set `HF_HUB_OFFLINE=1` when the network is flaky).
 
 ### Detection Pipeline
 

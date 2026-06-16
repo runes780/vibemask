@@ -68,6 +68,22 @@ def merge_spans(spans: List[Span], original_text: str) -> List[Span]:
             to_remove = []
             
             for existing in overlapping:
+                # Deterministic over-reach recovery: a model/heuristic span of a
+                # DIFFERENT type that fully contains a precise REGEX/SCHEMA span
+                # is over-reaching (e.g. model emits ACCOUNT "身份证号110101...",
+                # regex emits IDCN "110101..."). The deterministic span is
+                # authoritative on structured PII, so it wins: drop the model span
+                # and keep the precise one. Without this, model over-reach vetoes
+                # correct regex detections (IDCN recall collapsed 100% -> 0%).
+                if (
+                    existing.contains(span)
+                    and span.source in (SourceType.REGEX, SourceType.SCHEMA)
+                    and existing.source not in (SourceType.REGEX, SourceType.SCHEMA)
+                    and existing.type != span.type
+                ):
+                    to_remove.append(existing)
+                    continue
+
                 # CRITICAL: If existing span CONTAINS new span and has higher type priority,
                 # reject the new span (e.g., URL contains PERSON -> reject PERSON)
                 if existing.contains(span):

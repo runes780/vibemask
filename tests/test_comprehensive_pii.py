@@ -27,112 +27,114 @@ class TestPlaceholderGeneration:
         self.generator = PlaceholderGenerator()
     
     def test_person_name_2char(self):
-        """2-character Chinese name (surname + 1 char)."""
+        """2-character Chinese name -> bare typed token (no shape)."""
         from vibemask.core.span import EntityType
         original = "张三"
         masked = self.generator.generate(original, EntityType.PERSON)
         assert masked == "{{PERSON_000001}}"
         assert masked != original, "Masked should differ from original"
-    
+
     def test_person_name_3char(self):
         """3-character Chinese name (most common)."""
         from vibemask.core.span import EntityType
         original = "李明华"
         masked = self.generator.generate(original, EntityType.PERSON)
         assert masked == "{{PERSON_000001}}"
-    
+
     def test_person_name_4char_compound(self):
         """4-character name with compound surname."""
         from vibemask.core.span import EntityType
         original = "欧阳小雪"
         masked = self.generator.generate(original, EntityType.PERSON)
         assert masked == "{{PERSON_000001}}"
-    
+
     def test_phone_11_digits(self):
-        """11-digit Chinese mobile number."""
+        """11-digit mobile -> typed token with redacted digit shape."""
         from vibemask.core.span import EntityType
         original = "13812345678"
         masked = self.generator.generate(original, EntityType.PHONE)
-        assert len(masked) == len(original)
-        assert masked.isdigit(), "Phone mask should be all digits"
-    
+        assert masked == "{{PHONE_000001:###########}}"
+        assert "13812345678" not in masked, "No original digit may survive"
+
     def test_phone_with_separators(self):
-        """Phone number with separator preservation."""
+        """Separators are preserved in the shape, digits fully redacted."""
         from vibemask.core.span import EntityType
         original = "138-1234-5678"
         masked = self.generator.generate(original, EntityType.PHONE)
-        assert len(masked) == len(original)
-        assert masked[3] == "-", "First separator should be preserved"
-        assert masked[8] == "-", "Second separator should be preserved"
-    
+        assert masked == "{{PHONE_000001:###-####-####}}"
+
     def test_email_format(self):
-        """Email address with @ and domain preserved."""
+        """Email -> typed token; domain is redacted (no org leak)."""
         from vibemask.core.span import EntityType
         original = "test@example.com"
         masked = self.generator.generate(original, EntityType.EMAIL)
-        assert "@" in masked, "Email should contain @"
-        assert masked.endswith("@example.com"), "Domain should be preserved"
-        assert len(masked) == len(original)
-    
+        assert masked == "{{EMAIL_000001:XXXX@XXXXXXX.XXX}}"
+        assert "example.com" not in masked, "Domain must be redacted"
+        assert "test" not in masked, "Local part must be redacted"
+
     def test_idcn_18_digits(self):
-        """18-digit Chinese ID card number."""
+        """18-digit ID card -> typed token, region code not leaked."""
         from vibemask.core.span import EntityType
         original = "110101198801011234"
         masked = self.generator.generate(original, EntityType.IDCN)
-        assert len(masked) == len(original)
-    
+        assert masked == "{{IDCN_000001:##################}}"
+        assert "110101" not in masked, "Region code must not leak"
+
     def test_idcn_with_x(self):
-        """18-digit ID card ending with X."""
+        """18-digit ID ending with X keeps structural shape."""
         from vibemask.core.span import EntityType
         original = "11010119880101123X"
         masked = self.generator.generate(original, EntityType.IDCN)
-        assert len(masked) == len(original)
-    
+        assert masked.startswith("{{IDCN_000001:")
+        assert masked.endswith("}}")
+        assert "110101" not in masked
+
     def test_address_preserves_structure(self):
-        """Address masking preserves character classes."""
+        """Address -> typed token with redacted CJK/digit/letter shape."""
         from vibemask.core.span import EntityType
         original = "北京市朝阳区xxx路123号"
         masked = self.generator.generate(original, EntityType.ADDRESS)
-        assert len(masked) == len(original)
-    
+        assert masked.startswith("{{ADDRESS_000001:")
+        assert "北京市" not in masked
+
     def test_date_time_with_dashes(self):
-        """Date with dash separators."""
+        """ISO-style date keeps separators, digits redacted."""
         from vibemask.core.span import EntityType
         original = "2024-01-15"
         masked = self.generator.generate(original, EntityType.DATE_TIME)
-        assert len(masked) == len(original)
-        assert masked[4] == "-" and masked[7] == "-", "Date separators should be preserved"
-    
+        assert masked == "{{DATE_000001:####-##-##}}"
+
     def test_date_time_chinese_format(self):
-        """Date in Chinese format."""
+        """Chinese-format date: digits redacted, CJK markers become 某."""
         from vibemask.core.span import EntityType
         original = "2024年01月15日"
         masked = self.generator.generate(original, EntityType.DATE_TIME)
-        assert len(masked) == len(original)
-    
+        assert masked == "{{DATE_000001:####某##某##某}}"
+
     def test_url_format(self):
-        """URL masking preserves protocol and domain."""
+        """URL -> typed token; host/path redacted."""
         from vibemask.core.span import EntityType
         original = "https://example.com/user/123"
         masked = self.generator.generate(original, EntityType.URL)
-        assert masked.startswith("https://example.com"), "URL protocol and domain preserved"
+        assert masked.startswith("{{URL_000001:")
+        assert "example.com" not in masked
 
     def test_account_number_generic_mask(self):
-        """Privacy Filter account_number type gets a length-preserving placeholder."""
+        """account_number -> ACCOUNT typed token with redacted shape."""
         from vibemask.core.span import EntityType
         original = "4111111111111111"
         masked = self.generator.generate(original, EntityType.ACCOUNT_NUMBER)
-        assert len(masked) == len(original)
-        assert masked.isdigit()
+        assert masked == "{{ACCOUNT_000001:################}}"
+        assert original not in masked
 
     def test_secret_generic_mask(self):
-        """Privacy Filter secret type gets a length-preserving placeholder."""
+        """secret -> SECRET typed token; no original char survives."""
         from vibemask.core.span import EntityType
         original = "sk-test-secret"
         masked = self.generator.generate(original, EntityType.SECRET)
-        assert len(masked) == len(original)
-        assert masked != original
-    
+        assert masked == "{{SECRET_000001:XX-XXXX-XXXXXX}}"
+        assert "test" not in masked and "secret" not in masked
+
     def test_reverse_mappings(self):
         """Verify reverse mappings are created correctly."""
         from vibemask.core.span import EntityType

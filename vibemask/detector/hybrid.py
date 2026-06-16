@@ -12,7 +12,8 @@ from pathlib import Path
 from typing import Literal, Optional
 
 from ..core.merger import merge_spans
-from ..core.span import Span
+from ..core.span import EntityType, Span
+from .privacy_postprocess import is_false_person, is_field_label
 from .regex import detect_by_regex
 from .schema_context import detect_schema_context
 
@@ -58,6 +59,14 @@ class HybridDetector:
         if self.chinese_names_enabled and _contains_cjk(text):
             spans.extend(self._detect_chinese_names(text))
 
+        # Drop field-label words (headers like 姓名/手机号) and obvious non-name
+        # PERSON spans (万元/单位/single CJK char) before merging — these are
+        # column labels or financial/form vocabulary, never real PII values.
+        spans = [
+            s for s in spans
+            if not is_field_label(s.text)
+            and not (s.type == EntityType.PERSON and is_false_person(s.text))
+        ]
         return merge_spans(spans, text)
 
     def detect_document(self, processor: object, text: str) -> list[Span]:
@@ -77,6 +86,14 @@ class HybridDetector:
         if self.chinese_names_enabled and _contains_cjk(text):
             spans.extend(self._detect_chinese_names(text))
 
+        # Drop field-label words (headers like 姓名/手机号) and obvious non-name
+        # PERSON spans (万元/单位/single CJK char) before merging — these are
+        # column labels or financial/form vocabulary, never real PII values.
+        spans = [
+            s for s in spans
+            if not is_field_label(s.text)
+            and not (s.type == EntityType.PERSON and is_false_person(s.text))
+        ]
         return merge_spans(spans, text)
 
     def _detect_privacy_filter(self, text: str) -> list[Span]:
@@ -88,6 +105,7 @@ class HybridDetector:
                 privacy_filter_mlx = import_module("vibemask.detector.privacy_filter_mlx")
                 self._cached_privacy_detector = privacy_filter_mlx.PrivacyFilterMLXDetector(
                     checkpoint=self.privacy_checkpoint,
+                    decode_mode=self.privacy_decode_mode,
                 )
             else:
                 privacy_filter = import_module("vibemask.detector.privacy_filter")
@@ -101,7 +119,13 @@ class HybridDetector:
 
     def _detect_document_privacy(self, processor: object, text: str, privacy_detector: object) -> list[Span]:
         privacy_context = import_module("vibemask.detector.privacy_context")
+        # Structured tables (XLSX cells / DOCX table cells) get reconstructed as
+        # "header: value" pairs so headers act as labels and the model sees the
+        # column type for each value. Falls back to flat-text detection when the
+        # document has no recognized tabular structure.
         context_spans = privacy_context.detect_xlsx_row_context(processor, privacy_detector)
+        if not context_spans:
+            context_spans = privacy_context.detect_docx_table_context(processor, privacy_detector)
         if context_spans:
             return context_spans
         return privacy_detector.detect(text)
