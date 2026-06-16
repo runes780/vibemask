@@ -129,6 +129,15 @@ class HybridDetector:
         if not context_spans:
             context_spans = privacy_context.detect_docx_table_context(processor, privacy_detector)
         flat_spans = privacy_detector.detect(text)
+        # Suppress model spans that land in an explicitly non-personal column
+        # (e.g. 职位代码 values the model mis-flags as ACCOUNT_NUMBER). Structural
+        # column knowledge vetoes these unreliable model detections on tables.
+        non_pii_ranges = privacy_context.detect_non_pii_ranges(processor)
+        if non_pii_ranges:
+            flat_spans = [
+                s for s in flat_spans
+                if not any(r0 <= s.start < r1 or r0 < s.end <= r1 for r0, r1 in non_pii_ranges)
+            ]
         return (context_spans or []) + flat_spans
 
     def _detect_chinese_names(self, text: str) -> list[Span]:

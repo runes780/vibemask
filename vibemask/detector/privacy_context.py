@@ -81,6 +81,23 @@ def _header_type(header: str) -> str | None:
     return None
 
 
+# Column headers whose values are explicitly NOT personal data. Used to suppress
+# model false positives — e.g. a 职位代码 value (10806202657001) the model flags
+# as ACCOUNT_NUMBER. Only numeric *code* columns are listed (text columns like
+# 拟录用职位 / 职位名称 hold job descriptions, not PII, and broad 职位/岗位
+# matches would over-suppress legitimate detections landing in those cells).
+_NON_PII_LABELS = (
+    "职位代码", "岗位代码", "职务代码", "招考职位代码", "职位编号", "岗位编号",
+    "职位序号", "岗位序号", "招考岗位代码",
+)
+
+
+def _is_non_pii_header(header: str) -> bool:
+    h = _normalize_header(header)
+    return any(k in h for k in _NON_PII_LABELS)
+
+
+
 def _structural_spans_from_mappings(mappings: list[ContextValueMap]) -> list[Span]:
     """One span per labelled-column value — typed by its header — but ONLY when
     the value's format matches the claimed type. This fills the model's recall
@@ -161,6 +178,58 @@ _LABEL_SUFFIXES = (
     "业务", "项目", "范围", "内容", "说明", "学科", "教学", "机构", "部门",
     "名称", "事项", "指标", "金额", "日期", "年度", "月份",
 )
+
+
+def _group_docx_rows(segments: list[Any]) -> dict[tuple[str, str], dict[int, dict[int, Any]]]:
+    """Group DOCX table-cell segments by (part, table) -> {row: {col: segment}}."""
+    rows: dict[tuple[str, str], dict[int, dict[int, Any]]] = {}
+    for segment in segments:
+        match = DOCX_CELL_RE.match(getattr(segment, "location", "") or "")
+        if not match:
+            continue
+        key = (match.group("part"), match.group("tbl"))
+        row = int(match.group("row"))
+        col = int(match.group("col"))
+        rows.setdefault(key, {}).setdefault(row, {})[col] = segment
+    return rows
+
+
+def detect_non_pii_ranges(processor: Any) -> list[tuple[int, int]]:
+    """Return ``[(start_offset, end_offset), ...]`` for every value cell in an
+    explicitly non-personal column (职位代码 / 岗位代码 / ...). The caller uses
+    these to suppress model spans (e.g. a position code the model mis-flags as
+    ACCOUNT_NUMBER) — the column header declares the value non-personal."""
+    suffix = getattr(getattr(processor, "file_path", None), "suffix", "").lower()
+    segments = list(getattr(processor, "_segments", []) or [])
+    if suffix == ".xlsx":
+        grouped = _group_xlsx_rows(segments)  # {(part, row): {col: cell}}
+        # rebuild as tables[part][row] = {col: cell}
+        tables: dict[Any, dict[int, Any]] = {}
+        for (part, row), cells in grouped.items():
+            tables.setdefault(part, {})[row] = cells
+        find_header = _find_header_row
+    elif suffix == ".docx":
+        tables = _group_docx_rows(segments)  # {(part, tbl): {row: {col: cell}}}
+        find_header = _find_header_row_generic
+    else:
+        return []
+
+    ranges: list[tuple[int, int]] = []
+    for table_rows in tables.values():
+        header_row = find_header(table_rows)
+        if header_row is None:
+            continue
+        headers = {
+            col: _normalize_header(cell.text)
+            for col, cell in table_rows[header_row].items()
+            if getattr(cell, "text", "").strip()
+        }
+        for row in sorted(r for r in table_rows if r > header_row):
+            for col, cell in table_rows[row].items():
+                header = headers.get(col)
+                if header and _is_non_pii_header(header) and getattr(cell, "text", "").strip():
+                    ranges.append((cell.start_offset, cell.end_offset))
+    return ranges
 
 
 def detect_xlsx_row_context(processor: Any, privacy_detector: Any) -> list[Span]:
