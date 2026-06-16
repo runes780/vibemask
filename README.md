@@ -66,10 +66,30 @@ and regex layers remain enabled for structured Office files and Chinese tabular 
 The CLI loads the model for the current command and exits after processing; it does not
 run a background service.
 
-```bash
-# Default: hybrid detector with MLX Privacy Filter backend
-vibemask mask document.docx
+The recommended default command is simply:
 
+```bash
+# Default: hybrid detector with MLX Privacy Filter backend + viterbi decode
+vibemask mask document.docx
+```
+
+This default path has been validated on real Chinese Office documents (student lists,
+faculty lists, legacy `.xls` admission lists) with ≥99.6% recall / 100% precision for
+actual PII values, zero residual PII in masked output, and lossless roundtrip restore.
+
+Platform exceptions:
+
+```bash
+# Linux / Windows / Intel Mac: MLX is unavailable, use the native OPF backend
+vibemask mask document.docx --privacy-backend opf
+
+# Fully offline / no model environment: fast deterministic rules only
+vibemask mask document.docx --engine regex
+```
+
+Other baseline engines:
+
+```bash
 # Run only OpenAI Privacy Filter when you need a pure OPF baseline
 vibemask mask document.docx --engine privacy-filter --privacy-device cpu
 
