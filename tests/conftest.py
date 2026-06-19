@@ -42,10 +42,12 @@ class InMemoryVaultKeyStore:
 
 
 @pytest.fixture(autouse=True)
-def isolate_vault_keyring(monkeypatch: pytest.MonkeyPatch):
-    """Use one in-memory keyring per test, shared by all VaultStorage instances."""
+def isolate_vault_keyring(monkeypatch: pytest.MonkeyPatch, tmp_path):
+    """Isolate every test from the developer's real vault and OS keyring."""
     from vibemask.vault import storage
 
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("APPDATA", str(tmp_path / "appdata"))
     store = InMemoryVaultKeyStore()
     monkeypatch.setattr(storage, "default_key_store", lambda: store)
     return store

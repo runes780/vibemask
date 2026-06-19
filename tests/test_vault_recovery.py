@@ -63,6 +63,13 @@ def test_wrong_passphrase_and_tamper_use_safe_authentication_error(vault_with_da
         recovery_module().load_recovery_bundle(output, "correct horse battery staple")
 
 
+def test_new_recovery_bundle_rejects_short_passphrase(vault_with_data, tmp_path):
+    vault, _, _, _ = vault_with_data
+
+    with pytest.raises(recovery_module().RecoveryPassphraseError, match="at least 12"):
+        vault.backup_key(tmp_path / "vault-recovery.json", "too-short")
+
+
 @pytest.mark.parametrize(
     "mutation",
     [
@@ -84,6 +91,26 @@ def test_malformed_or_expensive_bundle_is_rejected_before_kdf(
 
     with pytest.raises(recovery_module().RecoveryBundleError, match="authentication failed"):
         recovery_module().load_recovery_bundle(output, "correct horse battery staple")
+
+
+def test_combined_scrypt_memory_cost_is_rejected_before_derivation(
+    vault_with_data, tmp_path, monkeypatch
+):
+    vault, _, _, _ = vault_with_data
+    output = tmp_path / "vault-recovery.json"
+    vault.backup_key(output, "correct horse battery staple")
+    envelope = json.loads(output.read_text())
+    envelope["kdf"].update({"n": 2**16, "r": 16})
+    output.write_text(json.dumps(envelope))
+    recovery = recovery_module()
+
+    def forbidden_scrypt(*args, **kwargs):
+        raise AssertionError("unsafe Scrypt parameters reached key derivation")
+
+    monkeypatch.setattr(recovery, "Scrypt", forbidden_scrypt)
+
+    with pytest.raises(recovery.RecoveryBundleError, match="authentication failed"):
+        recovery.load_recovery_bundle(output, "correct horse battery staple")
 
 
 def test_missing_keyring_material_can_be_restored_and_verified(vault_with_data, tmp_path):

@@ -71,6 +71,7 @@ def test_cli_exec_masks_prompt_args_and_runs_tool(tmp_path: Path, monkeypatch):
     ]
     mappings = VaultStorage(str(tmp_path)).get_all_mappings()
     assert mappings["{{PERSON_000001}}"] == "张三"
+    assert VaultStorage(str(tmp_path)).security_status()["epoch"] == 1
 
 
 def test_cli_exec_dry_run_does_not_run_tool(tmp_path: Path, monkeypatch):
@@ -104,8 +105,9 @@ def test_cli_exec_dry_run_does_not_run_tool(tmp_path: Path, monkeypatch):
 def test_root_double_dash_wraps_arbitrary_command(tmp_path: Path, monkeypatch):
     import vibemask.cli as cli
     import vibemask.detector.hybrid as hybrid
+    from vibemask.vault.storage import VaultStorage
 
-    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.chdir(tmp_path)
 
     class DummyHybridDetector:
         def __init__(self, **kwargs):
@@ -133,7 +135,8 @@ def test_root_double_dash_wraps_arbitrary_command(tmp_path: Path, monkeypatch):
     result = runner.invoke(cli.app, ["--", "echo", "hello"])
 
     assert result.exit_code == 0
-    assert calls == [(["echo", "hello"], Path.cwd().resolve(), False)]
+    assert calls == [(["echo", "hello"], tmp_path.resolve(), False)]
+    assert VaultStorage(str(tmp_path)).security_status()["epoch"] == 0
 
 
 def test_cli_exec_does_not_restore_files_dirty_before_command(tmp_path: Path, monkeypatch):

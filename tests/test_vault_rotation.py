@@ -115,6 +115,8 @@ def test_checkpoint_failure_after_commit_keeps_both_keys_and_recovers_on_open(
     assert store.get_encryption_key(vault.project_id, 1) is not None
     assert store.get_encryption_key(vault.project_id, 2) is not None
 
+    assert vault.get_mapping_by_masked(first) == "SYNTHETIC-ROTATE-A"
+
     reopened = VaultStorage(str(project), key_store=store)
     assert reopened.get_mapping_by_masked(first) == "SYNTHETIC-ROTATE-A"
     assert store.get_trusted_state(vault.project_id).active_key_version == 2

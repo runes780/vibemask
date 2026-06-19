@@ -41,6 +41,10 @@ class RecoveryReplaceRequired(RecoveryBundleError):
     """Restoring would replace different keyring material."""
 
 
+class RecoveryPassphraseError(RecoveryBundleError):
+    """A new recovery bundle passphrase does not meet the minimum policy."""
+
+
 @dataclass(frozen=True)
 class RecoveryPayload:
     project_id: str
@@ -78,6 +82,8 @@ def _validate_kdf(kdf: object) -> tuple[int, int, int, bytes]:
         or not isinstance(p, int)
         or isinstance(p, bool)
         or not 1 <= p <= MAX_SCRYPT_P
+        or 128 * n * r > 64 * 1024 * 1024
+        or n * r * p > 2**19
     ):
         raise ValueError("unsafe KDF parameters")
     salt = _decode(kdf["salt"])
@@ -149,6 +155,10 @@ def _deserialize_payload(encoded: bytes) -> RecoveryPayload:
 
 def create_recovery_envelope(payload: RecoveryPayload, passphrase: str) -> bytes:
     """Encrypt a recovery payload into the public JSON envelope."""
+    if not isinstance(passphrase, str) or len(passphrase) < 12:
+        raise RecoveryPassphraseError(
+            "Recovery bundle passphrase must contain at least 12 characters."
+        )
     salt = secrets.token_bytes(16)
     nonce = secrets.token_bytes(NONCE_SIZE)
     key = _derive_key(passphrase, salt, SCRYPT_N, SCRYPT_R, SCRYPT_P)

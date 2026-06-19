@@ -1130,6 +1130,9 @@ class VaultStorage:
         except Exception:
             if not committed:
                 self.key_store.delete_encryption_key(self.project_id, new_version)
+            else:
+                self.active_key_version = new_version
+                self._cipher = new_cipher
             raise
 
         self.active_key_version = new_version

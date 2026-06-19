@@ -1112,13 +1112,13 @@ def exec_(
     detector = None
     generator = PlaceholderGenerator()
 
-    masked_args: list[str] = []
-    replacements: dict[str, str] = {}
+    prepared_args: list[tuple[str, list]] = []
+    mapping_candidates: dict[str, tuple] = {}
     stats: dict[str, int] = {}
 
     for arg in raw_args:
         if not _should_mask_cli_arg(arg):
-            masked_args.append(arg)
+            prepared_args.append((arg, []))
             continue
 
         if detector is None:
@@ -1130,37 +1130,75 @@ def exec_(
                 chinese_names_enabled=True,
             )
         spans = merge_spans(detector.detect(arg), arg)
+        prepared_args.append((arg, spans))
         if not spans:
-            masked_args.append(arg)
             continue
 
-        arg_replacements = []
         for span in spans:
             try:
                 entity_type = span.type
             except ValueError:
                 entity_type = EntityType.UNKNOWN
 
-            proposed = generator.generate(span.text, entity_type)
-            masked = vault.get_or_create_mapping(
-                original=span.text,
-                entity_type=span.type.value,
-                masked=proposed,
-                source=span.source.value,
-                confidence=span.confidence,
-            )
-            replacements[span.text] = masked
             stats[span.type.value] = stats.get(span.type.value, 0) + 1
-            arg_replacements.append(
+            mapping_candidates.setdefault(
+                span.text,
+                (
+                    span.type.value,
+                    generator.generate(span.text, entity_type),
+                    span.source.value,
+                    span.confidence,
+                ),
+            )
+
+    def render_args(resolved: dict[str, str]) -> list[str]:
+        rendered = []
+        for argument, spans in prepared_args:
+            if not spans:
+                rendered.append(argument)
+                continue
+            arg_replacements = [
                 Replacement(
                     start=span.start,
                     end=span.end,
                     original=span.text,
-                    masked=masked,
+                    masked=resolved[span.text],
                 )
-            )
+                for span in spans
+            ]
+            rendered.append(apply_replacements(argument, arg_replacements))
+        return rendered
 
-        masked_args.append(apply_replacements(arg, arg_replacements))
+    session_id = None
+    if dry_run:
+        replacements = {
+            original: candidate[1] for original, candidate in mapping_candidates.items()
+        }
+        masked_args = render_args(replacements)
+    elif not mapping_candidates:
+        replacements = {}
+        masked_args = render_args(replacements)
+    else:
+        with vault.batch("exec-mask-session"):
+            replacements = {}
+            for original, candidate in mapping_candidates.items():
+                entity_type, proposed, source, confidence = candidate
+                replacements[original] = vault.get_or_create_mapping(
+                    original=original,
+                    entity_type=entity_type,
+                    masked=proposed,
+                    source=source,
+                    confidence=confidence,
+                )
+            masked_args = render_args(replacements)
+            if replacements:
+                session_id = vault.create_session(
+                    input_files=[],
+                    output_files=[],
+                    mappings={masked: original for original, masked in replacements.items()},
+                    stats=stats,
+                    status="pending",
+                )
 
     command = [tool, *masked_args]
     console.print("[bold]🎭 VibeMask Exec[/bold]")
@@ -1175,15 +1213,6 @@ def exec_(
         return
 
     changed_before = {path.resolve() for path in get_changed_files(project_path)}
-    session_id = None
-    if replacements:
-        session_id = vault.create_session(
-            input_files=[],
-            output_files=[],
-            mappings={masked: original for original, masked in replacements.items()},
-            stats=stats,
-            status="pending",
-        )
 
     try:
         result = subprocess.run(command, cwd=project_path, capture_output=False)
