@@ -14,7 +14,7 @@ from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from .crypto import (
     CIPHERTEXT_PREFIX,
@@ -31,6 +31,13 @@ from .integrity import (
 )
 from .keyring_policy import NativeKeyringStore, SecureKeyStore, resolve_encryption_key
 from .locking import VaultFileLock, assert_no_stale_sidecars
+from .recovery import (
+    RecoveryIdentityError,
+    RecoveryPayload,
+    RecoveryReplaceRequired,
+    load_recovery_bundle,
+    write_recovery_bundle,
+)
 
 
 ENCRYPTION_VERSION = 2
@@ -982,3 +989,119 @@ class VaultStorage:
             }
         )
         return result
+
+    def backup_key(
+        self,
+        output: Path,
+        passphrase: str,
+        *,
+        overwrite: bool = False,
+    ) -> None:
+        """Create a durable authenticated recovery bundle for the current key version."""
+        with self._lock:
+            conn = self._connect()
+            try:
+                state = self._verify_connection(conn)
+            finally:
+                conn.close()
+            encryption_key = self.key_store.get_encryption_key(
+                self.project_id, state.active_key_version
+            )
+            integrity_key = self.key_store.get_integrity_key(self.project_id)
+            if encryption_key is None or integrity_key is None:
+                raise VaultKeyMissingError("Vault recovery material is incomplete.")
+            exported_state = replace(
+                state, recovery_key_version=state.active_key_version
+            )
+            payload = RecoveryPayload(
+                project_id=self.project_id,
+                database_id=state.database_id,
+                key_version=state.active_key_version,
+                encryption_key=encryption_key,
+                integrity_key=integrity_key,
+                trusted_state=exported_state,
+            )
+            write_recovery_bundle(
+                Path(output), payload, passphrase, overwrite=overwrite
+            )
+            self.key_store.set_trusted_state(self.project_id, exported_state)
+
+    @classmethod
+    def restore_key_for_project(
+        cls,
+        project_path: str,
+        bundle: Path,
+        passphrase: str,
+        *,
+        key_store: Optional[SecureKeyStore] = None,
+        replace: bool = False,
+    ) -> "VaultStorage":
+        """Restore keyring material, then require a complete vault verification."""
+        store = key_store or default_key_store()
+        payload = load_recovery_bundle(Path(bundle), passphrase)
+        project_id = get_project_fingerprint(project_path)
+        if payload.project_id != project_id:
+            raise RecoveryIdentityError(
+                "The recovery bundle belongs to a different VibeMask project."
+            )
+        vault_path = get_vault_path(project_path)
+        if not vault_path.exists():
+            raise RecoveryIdentityError("The target vault database does not exist.")
+
+        lock = VaultFileLock(Path(f"{vault_path}.lock"))
+        with lock:
+            assert_no_stale_sidecars(vault_path)
+            conn = sqlite3.connect(vault_path, timeout=5.0)
+            try:
+                metadata = dict(
+                    conn.execute(
+                        "SELECT key, value FROM vault_meta "
+                        "WHERE key IN ('database_id', 'active_key_version')"
+                    ).fetchall()
+                )
+            finally:
+                conn.close()
+            if (
+                metadata.get("database_id") != payload.database_id
+                or metadata.get("active_key_version") != str(payload.key_version)
+            ):
+                raise RecoveryIdentityError(
+                    "The recovery bundle does not match the target vault database."
+                )
+
+            previous_key = store.get_encryption_key(project_id, payload.key_version)
+            previous_integrity = store.get_integrity_key(project_id)
+            previous_state = store.get_trusted_state(project_id)
+            differences = (
+                previous_key not in (None, payload.encryption_key)
+                or previous_integrity not in (None, payload.integrity_key)
+                or previous_state not in (None, payload.trusted_state)
+            )
+            if differences and not replace:
+                raise RecoveryReplaceRequired(
+                    "Different vault keyring material exists; explicit replacement is required."
+                )
+
+            store.set_encryption_key(project_id, payload.key_version, payload.encryption_key)
+            store.set_integrity_key(project_id, payload.integrity_key)
+            store.set_trusted_state(project_id, payload.trusted_state)
+
+        try:
+            restored = cls(project_path, key_store=store)
+            restored.verify()
+            return restored
+        except Exception:
+            with lock:
+                if previous_key is None:
+                    store.delete_encryption_key(project_id, payload.key_version)
+                else:
+                    store.set_encryption_key(project_id, payload.key_version, previous_key)
+                if previous_integrity is None:
+                    store.delete_integrity_key(project_id)
+                else:
+                    store.set_integrity_key(project_id, previous_integrity)
+                if previous_state is None:
+                    store.delete_trusted_state(project_id)
+                else:
+                    store.set_trusted_state(project_id, previous_state)
+            raise
