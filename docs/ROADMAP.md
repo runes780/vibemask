@@ -14,6 +14,18 @@
 
 ## Release blockers and remaining work
 
+### Latest local verification (2026-06-19)
+
+- `pytest tests/ -v`: **167 passed**, 6 upstream deprecation warnings.
+- Security-scope Ruff gate: passed.
+- Clean temporary environment with `pip 26.1.2`: `pip-audit` reported no known
+  dependency vulnerabilities; CycloneDX 1.6 SBOM generation produced 80 components.
+- `hybrid + OPF` golden evaluation: MICRO-F1 **90.9%**, WEIGHTED-F1 **91.6%**.
+- Default `hybrid + MLX` evaluation could not run in the restricted desktop session
+  because Metal is unavailable. It remains an Apple Silicon release gate.
+
+These checks do not replace the platform and release-corpus gates below.
+
 ### P0 — must pass before declaring the build production-ready on a platform
 
 - [ ] Run `scripts/vault_keyring_smoke.py --confirm-native-keyring` on a real macOS, Windows, and Linux desktop session. Restricted/headless CI does not prove native credential-store behavior.

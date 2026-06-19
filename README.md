@@ -10,7 +10,7 @@ Automatically mask sensitive information before AI processing, then restore afte
 
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](https://opensource.org/licenses/MIT)
-[![Tests](https://img.shields.io/badge/tests-50%20passed-brightgreen.svg)]()
+[![Tests](https://img.shields.io/badge/tests-167%20passed-brightgreen.svg)]()
 
 [Features](#-features) • [Quick Start](#-quick-start) • [Documentation](#-documentation) • [Architecture](#-architecture)
 
@@ -392,8 +392,9 @@ vibemask vault restore-key recovery.json --project-root /path/to/project
 
 Recovery bundles contain the encryption key, independent integrity key, and
 trusted state inside Scrypt-derived AES-GCM authenticated encryption. Passphrases
-are entered through hidden prompts; bundle files are atomically written with mode
-`0600` on POSIX. Store the bundle and its passphrase separately.
+must contain at least 12 characters and are entered through hidden prompts; bundle
+files are atomically written with mode `0600` on POSIX. Store the bundle and its
+passphrase separately.
 
 This is a production-oriented **local single-user** threat model. It protects a
 copied current database from offline disclosure and detects authenticated-data

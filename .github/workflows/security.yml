@@ -24,7 +24,8 @@ jobs:
       - name: Lint
         run: >-
           python -m ruff check
-          vibemask/vault vibemask/cli.py tests/test_vault_*.py
+          vibemask/vault vibemask/cli.py tests/conftest.py
+          tests/test_vault_*.py tests/test_cli_exec_wrapper.py
           scripts/vault_keyring_smoke.py
       - name: Audit Python dependencies
         run: python -m pip_audit
