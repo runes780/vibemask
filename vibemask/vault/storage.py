@@ -25,6 +25,7 @@ from .crypto import (
 )
 from .integrity import (
     VaultIntegrityError,
+    VaultTamperError,
     append_integrity_checkpoint,
     compare_with_trusted_state,
     validate_database,
@@ -131,14 +132,17 @@ class VaultStorage:
         
         # Initialize database
         self._init_db()
+        self.active_key_version = self._read_active_key_version()
         encrypted_data_exists = self._contains_encrypted_data()
         key = resolve_encryption_key(
             self.key_store,
             self.project_id,
-            1,
+            self.active_key_version,
             encrypted_data_exists=encrypted_data_exists,
         )
-        self._cipher = VaultCipher(key, self.project_id, key_version=1)
+        self._cipher = VaultCipher(
+            key, self.project_id, key_version=self.active_key_version
+        )
         self._migrate_sensitive_fields()
         self._initialize_integrity()
         self._ensure_private_permissions()
@@ -271,6 +275,24 @@ class VaultStorage:
         finally:
             conn.close()
 
+    def _read_active_key_version(self) -> int:
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                "SELECT value FROM vault_meta WHERE key = 'active_key_version'"
+            ).fetchone()
+        finally:
+            conn.close()
+        if row is None:
+            return 1
+        try:
+            version = int(row[0])
+        except (TypeError, ValueError) as exc:
+            raise VaultTamperError("The vault active key version is invalid.") from exc
+        if version < 1 or str(version) != row[0]:
+            raise VaultTamperError("The vault active key version is invalid.")
+        return version
+
     @staticmethod
     def _mapping_context(entity_id: str) -> str:
         return f"mappings:{entity_id}:original_text"
@@ -289,21 +311,21 @@ class VaultStorage:
         decoded = self._cipher.decrypt(value, self._session_context(session_id, field))
         return json.loads(decoded)
 
-    @staticmethod
-    def _migration_required(conn: sqlite3.Connection) -> bool:
+    def _migration_required(self, conn: sqlite3.Connection) -> bool:
         version = conn.execute(
             "SELECT value FROM vault_meta WHERE key = ?", ("encryption_version",)
         ).fetchone()
         if version is None or version[0] != str(ENCRYPTION_VERSION):
             return True
-        prefix = f"{CIPHERTEXT_PREFIX}1:%"
+        prefix = f"{CIPHERTEXT_PREFIX}{self.active_key_version}:%"
+        digest_prefix = f"vmhmac:v2:{self.active_key_version}:%"
         mapping = conn.execute(
             """
             SELECT 1 FROM mappings WHERE original_text NOT LIKE ?
-               OR original_digest IS NULL OR original_digest NOT LIKE 'vmhmac:v2:1:%'
+               OR original_digest IS NULL OR original_digest NOT LIKE ?
             LIMIT 1
             """,
-            (prefix,),
+            (prefix, digest_prefix),
         ).fetchone()
         session = conn.execute(
             """
@@ -346,7 +368,8 @@ class VaultStorage:
                     plaintext = original_text
                     original_text = self._cipher.encrypt(plaintext, context)
                     migrated_plaintext = True
-                if not original_digest or not original_digest.startswith("vmhmac:v2:1:"):
+                digest_prefix = f"vmhmac:v2:{self.active_key_version}:"
+                if not original_digest or not original_digest.startswith(digest_prefix):
                     original_digest = self._cipher.lookup_digest(plaintext, "mapping-original")
                 conn.execute(
                     "UPDATE mappings SET original_text = ?, original_digest = ? WHERE entity_id = ?",
@@ -456,12 +479,13 @@ class VaultStorage:
                 )
                 conn.execute(
                     "INSERT OR REPLACE INTO vault_meta(key, value) "
-                    "VALUES ('active_key_version', '1')"
+                    "VALUES ('active_key_version', ?)",
+                    (str(self.active_key_version),),
                 )
                 state = append_integrity_checkpoint(conn, integrity_key, "bootstrap")
                 conn.commit()
                 self.key_store.set_trusted_state(self.project_id, state)
-                self.active_key_version = 1
+                self.active_key_version = state.active_key_version
             except Exception:
                 conn.rollback()
                 raise
@@ -989,6 +1013,137 @@ class VaultStorage:
             }
         )
         return result
+
+    def _reencrypt_sensitive_rows(
+        self,
+        conn: sqlite3.Connection,
+        old_version: int,
+        new_cipher: VaultCipher,
+    ) -> None:
+        mapping_rows = conn.execute(
+            "SELECT entity_id, original_text FROM mappings ORDER BY entity_id"
+        ).fetchall()
+        for entity_id, encrypted in mapping_rows:
+            envelope = parse_envelope(encrypted)
+            if envelope.key_version != old_version:
+                raise VaultIntegrityError(
+                    "A mapping uses an unexpected encryption key version."
+                )
+            context = self._mapping_context(entity_id)
+            plaintext = self._cipher.decrypt(encrypted, context)
+            conn.execute(
+                "UPDATE mappings SET original_text = ?, original_digest = ? "
+                "WHERE entity_id = ?",
+                (
+                    new_cipher.encrypt(plaintext, context),
+                    new_cipher.lookup_digest(plaintext, "mapping-original"),
+                    entity_id,
+                ),
+            )
+
+        session_rows = conn.execute(
+            "SELECT session_id, input_files, output_files, mappings "
+            "FROM sessions ORDER BY session_id"
+        ).fetchall()
+        for session_id, input_files, output_files, mappings in session_rows:
+            encrypted_fields = []
+            for field, encrypted in zip(
+                ("input_files", "output_files", "mappings"),
+                (input_files, output_files, mappings),
+            ):
+                envelope = parse_envelope(encrypted)
+                if envelope.key_version != old_version:
+                    raise VaultIntegrityError(
+                        "A session uses an unexpected encryption key version."
+                    )
+                context = self._session_context(session_id, field)
+                plaintext = self._cipher.decrypt(encrypted, context)
+                encrypted_fields.append(new_cipher.encrypt(plaintext, context))
+            conn.execute(
+                "UPDATE sessions SET input_files = ?, output_files = ?, mappings = ? "
+                "WHERE session_id = ?",
+                (*encrypted_fields, session_id),
+            )
+
+    def _verify_decryptable_fields(
+        self, conn: sqlite3.Connection, cipher: VaultCipher
+    ) -> None:
+        for entity_id, encrypted in conn.execute(
+            "SELECT entity_id, original_text FROM mappings"
+        ):
+            cipher.decrypt(encrypted, self._mapping_context(entity_id))
+        for row in conn.execute(
+            "SELECT session_id, input_files, output_files, mappings FROM sessions"
+        ):
+            session_id = row[0]
+            for field, encrypted in zip(
+                ("input_files", "output_files", "mappings"), row[1:]
+            ):
+                decoded = cipher.decrypt(
+                    encrypted, self._session_context(session_id, field)
+                )
+                json.loads(decoded)
+
+    def rotate_key(self) -> int:
+        """Rotate every encrypted field transactionally and retire the old key last."""
+        if self._batch_conn is not None:
+            raise RuntimeError("Vault key rotation cannot run inside a write batch.")
+        self.verify()
+        old_version = self.active_key_version
+        new_version = old_version + 1
+        new_key = secrets.token_bytes(32)
+        new_cipher = VaultCipher(new_key, self.project_id, key_version=new_version)
+        self.key_store.set_encryption_key(self.project_id, new_version, new_key)
+        committed = False
+        state = None
+        try:
+            with self._lock:
+                assert_no_stale_sidecars(self.vault_path)
+                conn = self._connect()
+                try:
+                    trusted = self._verify_connection(conn)
+                    if trusted.active_key_version != old_version:
+                        raise VaultIntegrityError(
+                            "The vault active key changed before rotation acquired the lock."
+                        )
+                    conn.execute("BEGIN IMMEDIATE")
+                    self._reencrypt_sensitive_rows(conn, old_version, new_cipher)
+                    conn.execute(
+                        "INSERT OR REPLACE INTO vault_meta(key, value) "
+                        "VALUES ('active_key_version', ?)",
+                        (str(new_version),),
+                    )
+                    state = append_integrity_checkpoint(
+                        conn,
+                        self._integrity_key,
+                        "rotate-key",
+                        recovery_key_version=trusted.recovery_key_version,
+                    )
+                    conn.commit()
+                    committed = True
+                except Exception:
+                    conn.rollback()
+                    raise
+                finally:
+                    conn.close()
+            self.key_store.set_trusted_state(self.project_id, state)
+        except Exception:
+            if not committed:
+                self.key_store.delete_encryption_key(self.project_id, new_version)
+            raise
+
+        self.active_key_version = new_version
+        self._cipher = new_cipher
+        self.verify()
+        with self._lock:
+            conn = self._connect()
+            try:
+                self._verify_decryptable_fields(conn, new_cipher)
+                conn.execute("VACUUM")
+            finally:
+                conn.close()
+        self.key_store.delete_encryption_key(self.project_id, old_version)
+        return new_version
 
     def backup_key(
         self,
