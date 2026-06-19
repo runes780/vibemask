@@ -48,7 +48,8 @@ class StorageConfig(BaseModel):
     vault_path: str = "~/.vibemask"
     
     # Encryption
-    encrypt_mappings: bool = False
+    # Retained for config compatibility; vault encryption is always enforced.
+    encrypt_mappings: bool = True
     use_keychain: bool = False
     
     # Session retention
@@ -198,7 +199,7 @@ masking:
 
 storage:
   vault_path: ~/.vibemask
-  encrypt_mappings: false
+  encrypt_mappings: true  # always enforced; cannot downgrade to plaintext
   session_retention_days: 30
 
 # File processing

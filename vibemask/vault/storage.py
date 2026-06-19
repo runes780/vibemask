@@ -13,6 +13,17 @@ from pathlib import Path
 from typing import Dict, List, Optional
 from dataclasses import dataclass
 
+from .crypto import (
+    CIPHERTEXT_PREFIX,
+    KeyProvider,
+    KeyringKeyProvider,
+    VaultCipher,
+    resolve_vault_key,
+)
+
+
+ENCRYPTION_VERSION = 1
+
 
 @dataclass
 class MappingRecord:
@@ -70,6 +81,11 @@ def get_vault_path(project_path: str) -> Path:
     return get_vibemask_home() / "projects" / fingerprint / "vault.sqlite"
 
 
+def default_key_provider() -> KeyProvider:
+    """Return the production key provider; tests replace this factory."""
+    return KeyringKeyProvider()
+
+
 class VaultStorage:
     """
     SQLite-based storage for entity mappings.
@@ -80,10 +96,11 @@ class VaultStorage:
     - Session tracking for restoration
     """
     
-    def __init__(self, project_path: str):
+    def __init__(self, project_path: str, key_provider: Optional[KeyProvider] = None):
         self.project_path = project_path
         self.project_id = get_project_fingerprint(project_path)
         self.vault_path = get_vault_path(project_path)
+        self.key_provider = key_provider or default_key_provider()
         
         # Ensure directory exists
         self.vault_path.parent.mkdir(parents=True, exist_ok=True)
@@ -91,6 +108,14 @@ class VaultStorage:
         
         # Initialize database
         self._init_db()
+        encrypted_data_exists = self._contains_encrypted_data()
+        key = resolve_vault_key(
+            self.key_provider,
+            self.project_id,
+            encrypted_data_exists=encrypted_data_exists,
+        )
+        self._cipher = VaultCipher(key, self.project_id)
+        self._migrate_sensitive_fields()
         self._ensure_private_permissions()
 
     def _ensure_private_permissions(self):
@@ -127,6 +152,7 @@ class VaultStorage:
                 project_id TEXT NOT NULL,
                 entity_type TEXT NOT NULL,
                 original_text TEXT NOT NULL,
+                original_digest TEXT,
                 masked_text TEXT NOT NULL,
                 created_at TEXT NOT NULL,
                 last_seen_at TEXT NOT NULL,
@@ -148,15 +174,174 @@ class VaultStorage:
                 stats TEXT
             )
         ''')
+
+        conn.execute('''
+            CREATE TABLE IF NOT EXISTS vault_meta (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            )
+        ''')
+
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(mappings)")}
+        if "original_digest" not in columns:
+            conn.execute("ALTER TABLE mappings ADD COLUMN original_digest TEXT")
         
         # Indexes
         conn.execute('CREATE INDEX IF NOT EXISTS idx_mappings_project ON mappings(project_id)')
-        conn.execute('CREATE INDEX IF NOT EXISTS idx_mappings_original ON mappings(original_text, entity_type)')
+        conn.execute('DROP INDEX IF EXISTS idx_mappings_original')
+        conn.execute(
+            'CREATE INDEX IF NOT EXISTS idx_mappings_digest '
+            'ON mappings(project_id, original_digest, entity_type)'
+        )
         conn.execute('CREATE INDEX IF NOT EXISTS idx_mappings_masked ON mappings(project_id, masked_text)')
         conn.execute('CREATE INDEX IF NOT EXISTS idx_sessions_project ON sessions(project_id)')
         
         conn.commit()
         conn.close()
+
+    def _contains_encrypted_data(self) -> bool:
+        """Check only ciphertext markers; never load or expose stored plaintext."""
+        conn = sqlite3.connect(self.vault_path)
+        try:
+            prefix = f"{CIPHERTEXT_PREFIX}%"
+            mapping = conn.execute(
+                "SELECT 1 FROM mappings WHERE original_text LIKE ? LIMIT 1", (prefix,)
+            ).fetchone()
+            session = conn.execute(
+                """
+                SELECT 1 FROM sessions
+                WHERE input_files LIKE ? OR output_files LIKE ? OR mappings LIKE ?
+                LIMIT 1
+                """,
+                (prefix, prefix, prefix),
+            ).fetchone()
+            return mapping is not None or session is not None
+        finally:
+            conn.close()
+
+    @staticmethod
+    def _mapping_context(entity_id: str) -> str:
+        return f"mappings:{entity_id}:original_text"
+
+    @staticmethod
+    def _session_context(session_id: str, field: str) -> str:
+        return f"sessions:{session_id}:{field}"
+
+    def _encrypt_json(self, value, session_id: str, field: str) -> str:
+        encoded = json.dumps(value, ensure_ascii=False)
+        return self._cipher.encrypt(encoded, self._session_context(session_id, field))
+
+    def _decrypt_json(self, value: str, session_id: str, field: str, default):
+        if value is None:
+            return default
+        decoded = self._cipher.decrypt(value, self._session_context(session_id, field))
+        return json.loads(decoded)
+
+    @staticmethod
+    def _migration_required(conn: sqlite3.Connection) -> bool:
+        version = conn.execute(
+            "SELECT value FROM vault_meta WHERE key = ?", ("encryption_version",)
+        ).fetchone()
+        if version is None or version[0] != str(ENCRYPTION_VERSION):
+            return True
+        prefix = f"{CIPHERTEXT_PREFIX}%"
+        mapping = conn.execute(
+            """
+            SELECT 1 FROM mappings
+            WHERE original_text NOT LIKE ? OR original_digest IS NULL
+            LIMIT 1
+            """,
+            (prefix,),
+        ).fetchone()
+        session = conn.execute(
+            """
+            SELECT 1 FROM sessions
+            WHERE input_files IS NULL OR input_files NOT LIKE ?
+               OR output_files IS NULL OR output_files NOT LIKE ?
+               OR mappings IS NULL OR mappings NOT LIKE ?
+            LIMIT 1
+            """,
+            (prefix, prefix, prefix),
+        ).fetchone()
+        return mapping is not None or session is not None
+
+    def _migrate_sensitive_fields(self) -> None:
+        """Encrypt every legacy sensitive value in one idempotent transaction."""
+        conn = sqlite3.connect(self.vault_path)
+        migrated_plaintext = False
+        try:
+            if not self._migration_required(conn):
+                return
+            conn.execute("PRAGMA secure_delete = ON")
+            conn.execute("BEGIN IMMEDIATE")
+            mapping_rows = conn.execute(
+                "SELECT entity_id, original_text, original_digest FROM mappings"
+            ).fetchall()
+            for entity_id, original_text, original_digest in mapping_rows:
+                context = self._mapping_context(entity_id)
+                if self._cipher.is_encrypted(original_text):
+                    plaintext = self._cipher.decrypt(original_text, context)
+                else:
+                    plaintext = original_text
+                    original_text = self._cipher.encrypt(plaintext, context)
+                    migrated_plaintext = True
+                digest = original_digest or self._cipher.lookup_digest(plaintext, "mapping-original")
+                conn.execute(
+                    "UPDATE mappings SET original_text = ?, original_digest = ? WHERE entity_id = ?",
+                    (original_text, digest, entity_id),
+                )
+
+            session_rows = conn.execute(
+                "SELECT session_id, input_files, output_files, mappings FROM sessions"
+            ).fetchall()
+            for session_id, input_files, output_files, mappings in session_rows:
+                values = {
+                    "input_files": input_files if input_files is not None else "[]",
+                    "output_files": output_files if output_files is not None else "[]",
+                    "mappings": mappings if mappings is not None else "{}",
+                }
+                encrypted_values = {}
+                for field, value in values.items():
+                    if self._cipher.is_encrypted(value):
+                        self._cipher.decrypt(value, self._session_context(session_id, field))
+                        encrypted_values[field] = value
+                    else:
+                        encrypted_values[field] = self._cipher.encrypt(
+                            value, self._session_context(session_id, field)
+                        )
+                        migrated_plaintext = True
+                conn.execute(
+                    """
+                    UPDATE sessions
+                    SET input_files = ?, output_files = ?, mappings = ?
+                    WHERE session_id = ?
+                    """,
+                    (
+                        encrypted_values["input_files"],
+                        encrypted_values["output_files"],
+                        encrypted_values["mappings"],
+                        session_id,
+                    ),
+                )
+
+            conn.execute(
+                "INSERT OR REPLACE INTO vault_meta(key, value) VALUES (?, ?)",
+                ("encryption_version", str(ENCRYPTION_VERSION)),
+            )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+        if migrated_plaintext:
+            vacuum = sqlite3.connect(self.vault_path)
+            try:
+                vacuum.execute("PRAGMA secure_delete = ON")
+                vacuum.execute("VACUUM")
+            finally:
+                vacuum.close()
     
     def get_or_create_mapping(
         self,
@@ -172,16 +357,21 @@ class VaultStorage:
         """
         conn = sqlite3.connect(self.vault_path)
         cursor = conn.cursor()
-        
+
+        original_digest = self._cipher.lookup_digest(original, "mapping-original")
         # Check for existing mapping
         cursor.execute('''
-            SELECT masked_text, entity_id FROM mappings
-            WHERE project_id = ? AND original_text = ? AND entity_type = ?
-        ''', (self.project_id, original, entity_type))
+            SELECT masked_text, entity_id, original_text FROM mappings
+            WHERE project_id = ? AND original_digest = ? AND entity_type = ?
+        ''', (self.project_id, original_digest, entity_type))
         
         row = cursor.fetchone()
         
         if row:
+            stored_original = self._cipher.decrypt(row[2], self._mapping_context(row[1]))
+            if stored_original != original:
+                conn.close()
+                raise RuntimeError("Vault mapping digest collision detected.")
             # Update last_seen_at
             cursor.execute('''
                 UPDATE mappings SET last_seen_at = ? WHERE entity_id = ?
@@ -246,6 +436,7 @@ class VaultStorage:
         # Create new mapping
         entity_id = str(uuid.uuid4())
         now = datetime.now().isoformat()
+        encrypted_original = self._cipher.encrypt(original, self._mapping_context(entity_id))
 
         # Ensure masked_text is unique within project to guarantee lossless restoration.
         candidate_masked = masked
@@ -266,11 +457,11 @@ class VaultStorage:
 
         cursor.execute('''
             INSERT INTO mappings 
-            (entity_id, project_id, entity_type, original_text, masked_text, 
-             created_at, last_seen_at, source, confidence)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ''', (entity_id, self.project_id, entity_type, original, candidate_masked, 
-              now, now, source, confidence))
+            (entity_id, project_id, entity_type, original_text, original_digest,
+             masked_text, created_at, last_seen_at, source, confidence)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (entity_id, self.project_id, entity_type, encrypted_original, original_digest,
+              candidate_masked, now, now, source, confidence))
         
         conn.commit()
         conn.close()
@@ -282,14 +473,16 @@ class VaultStorage:
         cursor = conn.cursor()
         
         cursor.execute('''
-            SELECT original_text FROM mappings
+            SELECT entity_id, original_text FROM mappings
             WHERE project_id = ? AND masked_text = ?
         ''', (self.project_id, masked))
         
         row = cursor.fetchone()
         conn.close()
         
-        return row[0] if row else None
+        if not row:
+            return None
+        return self._cipher.decrypt(row[1], self._mapping_context(row[0]))
     
     def get_all_mappings(self) -> Dict[str, str]:
         """Get all mappings for the project {masked -> original}."""
@@ -297,11 +490,14 @@ class VaultStorage:
         cursor = conn.cursor()
         
         cursor.execute('''
-            SELECT masked_text, original_text FROM mappings
+            SELECT entity_id, masked_text, original_text FROM mappings
             WHERE project_id = ?
         ''', (self.project_id,))
         
-        mappings = {row[0]: row[1] for row in cursor.fetchall()}
+        mappings = {
+            row[1]: self._cipher.decrypt(row[2], self._mapping_context(row[0]))
+            for row in cursor.fetchall()
+        }
         conn.close()
         
         return mappings
@@ -334,9 +530,9 @@ class VaultStorage:
             self.project_id,
             now,
             status,
-            json.dumps(input_files),
-            json.dumps(output_files),
-            json.dumps(mappings),
+            self._encrypt_json(input_files, session_id, "input_files"),
+            self._encrypt_json(output_files, session_id, "output_files"),
+            self._encrypt_json(mappings, session_id, "mappings"),
             json.dumps(stats)
         ))
         
@@ -367,9 +563,9 @@ class VaultStorage:
             project_id=row[1],
             created_at=row[2],
             status=row[3],
-            input_files=json.loads(row[4]),
-            output_files=json.loads(row[5]),
-            mappings=json.loads(row[6]),
+            input_files=self._decrypt_json(row[4], row[0], "input_files", []),
+            output_files=self._decrypt_json(row[5], row[0], "output_files", []),
+            mappings=self._decrypt_json(row[6], row[0], "mappings", {}),
             stats=json.loads(row[7])
         )
     
@@ -394,9 +590,9 @@ class VaultStorage:
                 project_id=row[1],
                 created_at=row[2],
                 status=row[3],
-                input_files=json.loads(row[4]),
-                output_files=json.loads(row[5]),
-                mappings=json.loads(row[6]),
+                input_files=self._decrypt_json(row[4], row[0], "input_files", []),
+                output_files=self._decrypt_json(row[5], row[0], "output_files", []),
+                mappings=self._decrypt_json(row[6], row[0], "mappings", {}),
                 stats=json.loads(row[7])
             ))
         
@@ -422,8 +618,8 @@ class VaultStorage:
         ''', (self.project_id,))
         
         for row in cursor.fetchall():
-            input_files = json.loads(row[4])
-            output_files = json.loads(row[5])
+            input_files = self._decrypt_json(row[4], row[0], "input_files", [])
+            output_files = self._decrypt_json(row[5], row[0], "output_files", [])
             # Check if file matches (handling potential relative/absolute mismatches)
             all_files = list(input_files) + list(output_files)
             for f in all_files:
@@ -436,7 +632,7 @@ class VaultStorage:
                         status=row[3],
                         input_files=input_files,
                         output_files=output_files,
-                        mappings=json.loads(row[6]),
+                        mappings=self._decrypt_json(row[6], row[0], "mappings", {}),
                         stats=json.loads(row[7])
                     )
         
@@ -457,7 +653,11 @@ class VaultStorage:
             cursor.execute('''
                 UPDATE sessions SET status = ?, output_files = ?
                 WHERE session_id = ?
-            ''', (status, json.dumps(output_files), session_id))
+            ''', (
+                status,
+                self._encrypt_json(output_files, session_id, "output_files"),
+                session_id,
+            ))
         else:
             cursor.execute('''
                 UPDATE sessions SET status = ? WHERE session_id = ?
@@ -488,6 +688,10 @@ class VaultStorage:
         ''', (self.project_id,))
         
         session_counts = {row[0]: row[1] for row in cursor.fetchall()}
+
+        version_row = cursor.execute(
+            "SELECT value FROM vault_meta WHERE key = ?", ("encryption_version",)
+        ).fetchone()
         
         conn.close()
         
@@ -498,4 +702,7 @@ class VaultStorage:
             "sessions_by_status": session_counts,
             "total_mappings": sum(type_counts.values()),
             "total_sessions": sum(session_counts.values()),
+            "encryption": self._cipher.algorithm,
+            "key_provider": self.key_provider.name,
+            "encryption_version": int(version_row[0]) if version_row else 0,
         }

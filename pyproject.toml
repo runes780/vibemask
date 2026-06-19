@@ -14,6 +14,8 @@ dependencies = [
     "rich>=13.0.0",
     "pydantic>=2.0.0",
     "lxml>=5.0.0",        # OOXML lossless processing
+    "cryptography>=41.0.0", # AES-256-GCM vault encryption
+    "keyring>=24.0.0",     # OS Keychain/Credential Manager integration
 ]
 
 [project.optional-dependencies]
@@ -41,11 +43,8 @@ wrapper = [
     "httpx>=0.25.0",
 ]
 
-# Secure storage (keychain/keyring)
-secure = [
-    "keyring>=24.0.0",
-    "cryptography>=41.0.0",
-]
+# Backward-compatible extra; secure storage is now always enabled.
+secure = []
 
 # Model judge (ONNX offline)
 model = [

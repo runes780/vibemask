@@ -831,6 +831,10 @@ def status(
         f"[bold]🎭 VibeMask Status[/bold]\n\n"
         f"[cyan]Vault:[/cyan] {stats['vault_path']}\n"
         f"[cyan]Project ID:[/cyan] {stats['project_id']}\n\n"
+        f"[bold]Encryption:[/bold]\n"
+        f"  Algorithm: {stats['encryption']}\n"
+        f"  Key store: {stats['key_provider']}\n"
+        f"  Format version: {stats['encryption_version']}\n\n"
         f"[bold]Mappings:[/bold]\n" +
         "\n".join(f"  {k}: {v}" for k, v in stats['mappings_by_type'].items()) +
         f"\n  [dim]Total: {stats['total_mappings']}[/dim]\n\n"

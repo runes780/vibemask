@@ -217,9 +217,9 @@ L2 输出的是 **候选 spans**，不直接认定为敏感。
 
 ### 8.2 加密策略（MVP 必做）
 
-二选一（默认优先 A）：
+当前实现采用 A；B 保留为无系统密钥环环境的后续兼容方案：
 
-* A：OS Keychain/Keyring 存主密钥，vault 内容 AES-GCM 加密
+* A（已实现）：每项目独立随机 256-bit 密钥存入 OS Keychain/Keyring；原始值、会话映射和输入输出文件名使用 AES-256-GCM 字段级加密。旧明文库首次打开时事务迁移；密钥缺失或 Keyring 不可用时失败关闭，不降级为明文。
 * B：用户 passphrase 派生密钥（Argon2/PBKDF2），vault 加密
 
 ### 8.3 Vault 数据模型（逻辑字段）
@@ -228,7 +228,7 @@ L2 输出的是 **候选 spans**，不直接认定为敏感。
 * `project_id`
 * `type`（PERSON/PHONE/EMAIL/IDCN/ORG/ADDRESS）
 * `original_text`（加密存储）
-* `masked_text`（可明文或加密，推荐加密）
+* `masked_text`（明文；只含无原始 PII 的类型化占位符，用于索引和恢复查找）
 * `created_at / last_seen_at`
 * `source`（regex/heuristic/llm_judge/schema）
 * `confidence`
@@ -724,4 +724,3 @@ whitelist:
 ---
 
 如果你下一步希望我再继续，我建议进入“**更像工程设计文档**”的层级：我可以把 `候选挖掘规则（中文人名）`、`姓氏表策略`、`chunk 分块与全局 offset 映射`、以及 `Ollama 调用的具体 payload（HTTP）` 都写成一份 **Tech Spec**，让你/开发者直接照着实现。
-

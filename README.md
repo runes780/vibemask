@@ -34,7 +34,7 @@ When using AI tools (Claude, ChatGPT, Copilot) with sensitive documents, private
 | 🔒 **Auto Detection** | Hybrid detection with schema rules, regex, OpenAI Privacy Filter native spans, Qwen, and Presidio |
 | 📐 **Format Aware** | Structured values keep useful shape where possible; names use clear typed tokens |
 | 🔓 **Lossless Restore** | Perfect roundtrip: mask → AI → restore = original |
-| 💾 **Secure Vault** | SQLite storage outside project directory |
+| 💾 **Encrypted Vault** | AES-256-GCM field encryption with per-project keys in the OS keyring |
 | 🌐 **Web UI** | Modern drag-and-drop interface |
 | 📄 **Office Support** | DOCX, XLSX, PPTX, PDF with lossless processing |
 | ⚡ **High Performance** | 100K chars in < 2 seconds |
@@ -360,6 +360,20 @@ Mappings are stored outside your project for security:
 │   └── vault.sqlite      # Mapping database
 └── logs/
 ```
+
+Reversible values, session mappings, and source/output file names are encrypted
+with AES-256-GCM. Each project has an independent random key stored by the
+operating-system keyring (macOS Keychain, Windows Credential Manager, or the
+configured Linux secret-service backend). Generated placeholders and aggregate
+statistics remain plaintext because they do not contain original PII.
+
+Existing plaintext vaults are migrated transactionally the first time they are
+opened by this version. Migration does not print values or create a plaintext
+backup. If the keyring is unavailable, or an encrypted vault's key has been
+deleted, VibeMask fails closed instead of creating or using a plaintext vault.
+Losing the key permanently makes that project's encrypted mappings impossible
+to restore, so Keychain/keyring backups must be included in the user's backup
+policy.
 
 ## 🧪 Testing
 
