@@ -89,7 +89,13 @@ def _structural_spans_from_mappings(mappings: list[ContextValueMap]) -> list[Spa
     gap on identifiers (学号/工号/准考证号/手机/邮箱/身份证/URL) without emitting
     garbage on messy tables: PERSON/ADDRESS/ORG are too ambiguous to trust
     structurally (a 4-CJK cell could be a name or a label like 工作单位), so they
-    are left to the heuristic/model layers."""
+    are left to the heuristic/model layers.
+
+    Accepts any duck-typed mapping exposing ``header``/``original_start``/
+    ``original_end``/``original_text`` — in particular the
+    :class:`vibemask.core.table_serializer.ContextValueMap` produced by the
+    unified serializer.
+    """
     spans: list[Span] = []
     for m in mappings:
         etype = _header_type(m.header)
@@ -113,6 +119,13 @@ def _structural_spans_from_mappings(mappings: list[ContextValueMap]) -> list[Spa
             )
         )
     return spans
+
+
+# Public alias so hybrid.py can call it without reaching for a private name.
+# Kept as a thin wrapper (not a rename) to avoid disturbing legacy callers.
+def structural_spans_from_mappings(mappings: list) -> list[Span]:
+    """Public entry point for :func:`_structural_spans_from_mappings`."""
+    return _structural_spans_from_mappings(mappings)
 
 
 # Format validators: a structural span is only emitted when the cell value

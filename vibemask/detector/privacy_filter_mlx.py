@@ -19,12 +19,21 @@ from .privacy_postprocess import refine_privacy_filter_spans
 
 DEFAULT_MLX_MODEL = "mlx-community/openai-privacy-filter-8bit"
 
-# Inference windowing: long inputs (large documents / reconstructed table
-# context) otherwise produce a logits tensor that OOMs the Metal allocator.
-# 512 is the typical max position for this BERT-style model; the overlap lets
-# an entity straddling a boundary be recovered whole from a neighbour window.
-_MAX_TOKENS = 512
-_OVERLAP_TOKENS = 64
+# Inference windowing. The Privacy Filter is a YaRN-RoPE decoder whose config
+# reports ``max_position_embeddings = 131072`` and ``initial_context_length =
+# 4096`` (the length it was trained around) — it is NOT a 512-position BERT.
+# We target the trained length (4096) so the model sees near-complete documents
+# in a single window, and align the overlap with ``sliding_window = 128`` so an
+# entity straddling a boundary is recovered whole from the neighbour window.
+#
+# The binding constraint is unified-memory allocation on Apple Silicon, not the
+# model architecture: the logits tensor is ``[1, seq_len, num_labels]`` plus an
+# 8-layer MoE KV cache. On a 16 GB machine 4096 is comfortable, but we still
+# auto-downgrade on Metal allocation failure rather than crash (see
+# ``_infer_labels``).
+_DEFAULT_MAX_TOKENS = 4096
+_MIN_MAX_TOKENS = 512  # never go below the legacy window
+_OVERLAP_TOKENS = 128  # matches config sliding_window
 
 
 class PrivacyFilterMLXDetector:
@@ -35,12 +44,18 @@ class PrivacyFilterMLXDetector:
         *,
         checkpoint: Optional[str | Path] = None,
         decode_mode: str = "viterbi",
+        max_tokens: Optional[int] = None,
     ) -> None:
         self.checkpoint = str(checkpoint) if checkpoint is not None else DEFAULT_MLX_MODEL
         # ``viterbi`` enforces valid BIOES sequences (fixes the type-flipping
         # fragmentation naive argmax produces); ``argmax`` is the legacy path,
         # kept for comparison/regression checks.
         self.decode_mode = decode_mode
+        # Inference window. Defaults to the model's trained context length;
+        # callers (e.g. HybridDetector.privacy_context_window) can override.
+        # Auto-downgrades at runtime if Metal cannot allocate the window.
+        self.max_tokens = max_tokens or _DEFAULT_MAX_TOKENS
+        self._effective_max_tokens: Optional[int] = None
         self._model = None
         self._tokenizer = None
         self._mx = None
@@ -66,19 +81,65 @@ class PrivacyFilterMLXDetector:
         all_spans: list[Span] = []
         seen: set = set()
         n = len(input_ids)
-        step = _MAX_TOKENS - _OVERLAP_TOKENS
-        for start in range(0, n, step):
-            end = min(start + _MAX_TOKENS, n)
-            labels = self._infer_labels(mx, model, id2label, input_ids[start:end])
-            for span in _spans_from_token_labels(text, labels, offsets[start:end]):
+        start = 0
+        while start < n:
+            window = self._effective_window()
+            end = min(start + window, n)
+            labels = self._infer_windowed(mx, model, id2label, input_ids[start:end])
+            if not labels:
+                raise RuntimeError("MLX Privacy Filter returned no labels for a non-empty window.")
+            # An OOM retry may have truncated the submitted chunk to a smaller
+            # effective window. Advance from what was actually processed, not
+            # from the pre-OOM end, or the gap would never be scanned.
+            processed_end = min(start + len(labels), n)
+            for span in _spans_from_token_labels(text, labels, offsets[start:processed_end]):
                 key = (span.start, span.end, span.type, span.text)
                 if key not in seen:
                     seen.add(key)
                     all_spans.append(span)
-            if end >= n:
+            if processed_end >= n:
                 break
+            current_window = self._effective_window()
+            overlap = min(_OVERLAP_TOKENS, current_window // 4)
+            start = max(start + 1, processed_end - overlap)
 
         return refine_privacy_filter_spans(all_spans, text)
+
+    def _effective_window(self) -> int:
+        """The currently-active inference window (possibly downgraded)."""
+        return self._effective_max_tokens or self.max_tokens
+
+    def _infer_windowed(self, mx, model, id2label, chunk_ids: list[int]) -> list[str]:
+        """Run inference on one window, auto-downgrading the window size on
+        Metal allocation failure.
+
+        On the first OOM we halve ``_effective_max_tokens`` (down to
+        ``_MIN_MAX_TOKENS``) and retry the *same* chunk truncated to the new
+        size. The downgrade is cached so subsequent windows reuse it. This lets
+        us target the trained 4096 context on roomy machines while degrading
+        gracefully on memory-constrained ones, instead of crashing.
+        """
+        while True:
+            try:
+                return self._infer_labels(mx, model, id2label, chunk_ids)
+            except MemoryError:
+                raise  # Python-level memory errors are not recoverable here.
+            except Exception as exc:  # Metal allocation / runtime failures
+                if not self._is_allocation_failure(exc):
+                    raise
+                new_size = max(_MIN_MAX_TOKENS, self._effective_window() // 2)
+                if new_size >= self._effective_window():
+                    raise  # cannot downgrade further
+                self._effective_max_tokens = new_size
+                chunk_ids = chunk_ids[:new_size]
+                if not chunk_ids:
+                    return []
+
+    @staticmethod
+    def _is_allocation_failure(exc: Exception) -> bool:
+        """Heuristic: did the MLX/Metal backend fail to allocate memory?"""
+        msg = str(exc).lower()
+        return any(s in msg for s in ("out of memory", "oom", "allocation", "metal"))
 
     def _infer_labels(self, mx, model, id2label, chunk_ids: list[int]) -> list[str]:
         """Run the model on one token window and return the decoded label sequence."""

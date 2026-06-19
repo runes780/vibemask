@@ -106,6 +106,7 @@ class HybridDetector:
                 self._cached_privacy_detector = privacy_filter_mlx.PrivacyFilterMLXDetector(
                     checkpoint=self.privacy_checkpoint,
                     decode_mode=self.privacy_decode_mode,
+                    max_tokens=self.privacy_context_window,
                 )
             else:
                 privacy_filter = import_module("vibemask.detector.privacy_filter")
@@ -118,28 +119,47 @@ class HybridDetector:
         return self._cached_privacy_detector
 
     def _detect_document_privacy(self, processor: object, text: str, privacy_detector: object) -> list[Span]:
+        # Unified structured serialization: any privacy table (XLSX / DOCX /
+        # legacy .xls) is reconstructed into ``"header: value"`` rows via one
+        # format-agnostic serializer, replacing the previous per-format
+        # context builders. The model runs once on the serialized table text
+        # (context path) and once on the flat text with table cells excluded
+        # (narrative path). The two passes cover disjoint regions, so no manual
+        # overlap dedup is needed between them — merge_spans handles the rest.
+        table_serializer = import_module("vibemask.core.table_serializer")
         privacy_context = import_module("vibemask.detector.privacy_context")
-        # Structured tables (XLSX cells / DOCX table cells) get reconstructed as
-        # "header: value" pairs so headers act as labels and the model sees the
-        # column type for each value. Falls back to flat-text detection when the
-        # Table context gives precise column-based spans; the flat-text pass
-        # below catches narrative PII that lives outside tables (e.g. a
-        # 监督电话 in a paragraph). Both are returned — merge_spans dedups.
-        context_spans = privacy_context.detect_xlsx_row_context(processor, privacy_detector)
-        if not context_spans:
-            context_spans = privacy_context.detect_docx_table_context(processor, privacy_detector)
+
+        segments = list(getattr(processor, "_segments", []) or [])
+        context_text, mappings = table_serializer.serialize_tables(segments)
+
+        spans: list[Span] = []
+        if context_text and mappings:
+            # Context path: model sees headers-as-labels next to each value.
+            detected = privacy_detector.detect(context_text)
+            spans.extend(table_serializer.map_context_spans(detected, mappings))
+            # Structural fallback: one typed span per privacy-column value whose
+            # format matches its header — fills the model's recall gap on
+            # identifiers (学号/工号/手机…) without emitting garbage on messy
+            # tables. Reuses the privacy_context helper unchanged for now.
+            spans.extend(privacy_context.structural_spans_from_mappings(mappings))
+
+            # Narrative path: model on the flat text, but only outside the
+            # table cells the structured path already owns. This keeps the
+            # model from re-flagging table cells (position-code / run-split
+            # false positives) while still catching PII in surrounding prose.
+            table_cell_ranges = privacy_context.detect_table_cell_ranges(processor)
+        else:
+            # No privacy table: plain flat-text detection.
+            table_cell_ranges = None
+
         flat_spans = privacy_detector.detect(text)
-        # The model's flat-text pass should not re-process table cells that
-        # structural detection owns — it only adds false positives there
-        # (position codes, run-fragmentation). The model already saw the table
-        # via the reconstructed context above; here it only handles narrative.
-        table_cell_ranges = privacy_context.detect_table_cell_ranges(processor)
         if table_cell_ranges:
             flat_spans = [
                 s for s in flat_spans
                 if not any(r0 <= s.start < r1 or r0 < s.end <= r1 for r0, r1 in table_cell_ranges)
             ]
-        return (context_spans or []) + flat_spans
+        spans.extend(flat_spans)
+        return spans
 
     def _detect_chinese_names(self, text: str) -> list[Span]:
         smart_detector = import_module("vibemask.detector.smart_detector")
