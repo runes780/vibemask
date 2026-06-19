@@ -93,3 +93,16 @@ tests/*_restored.*
 # Config with secrets
 .vibemask.yaml
 !.vibemask.yaml.example
+
+# Eval: generated artifacts (regenerable from eval/golden.py + eval/runner.py)
+eval/golden/all.jsonl
+eval/reports/*.json
+
+# Local demo/benchmark directories (per CLAUDE.md: never commit real PII)
+demo/
+demo_mlx/
+
+# Real-PII test fixtures kept local only (contain real names/IDs — do not commit)
+tests/3911230.xlsx
+tests/a523892c659b4a6f95f93675cfaf0acd.xlsx
+tests/附件*.xlsx

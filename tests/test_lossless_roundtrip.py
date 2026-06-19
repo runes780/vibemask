@@ -69,10 +69,11 @@ def test_placeholder_phone_preserves_separators():
     g = PlaceholderGenerator()
     original = "138-1234-5678"
     masked = g.generate(original, EntityType.PHONE)
-    assert len(masked) == len(original)
-    assert masked[3] == "-"
-    assert masked[8] == "-"
-    assert masked.replace("-", "").isdigit()
+    # Type-preserving token whose redacted shape keeps the dash separators, with
+    # no original digit surviving.
+    assert masked == "{{PHONE_000001:###-####-####}}"
+    assert "13812345678" not in masked
+    assert original not in masked
 
 
 def test_vault_enforces_unique_masked_values(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):

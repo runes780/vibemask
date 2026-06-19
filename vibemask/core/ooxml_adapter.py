@@ -15,6 +15,45 @@ from .ooxml import OOXMLProcessor as BaseOOXMLProcessor, etree
 SPREADSHEET_NS = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
 SPREADSHEET_NAMESPACES = {"spreadsheet": SPREADSHEET_NS}
 
+WORD_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+_W = f"{{{WORD_NS}}}"
+_W_TBL, _W_TR, _W_TC = f"{_W}tbl", f"{_W}tr", f"{_W}tc"
+
+
+def _docx_table_coordinate(container) -> str | None:
+    """Return ``tbl{i}.r{j}.c{k}`` if ``container`` (a ``w:p``) sits in a table cell.
+
+    Indices count preceding siblings of the same tag, so they are stable within
+    a document part. Returns None for paragraphs outside any table.
+    """
+    tbl = tr = tc = None
+    for anc in container.iterancestors():
+        if anc.tag == _W_TC:
+            tc = anc
+        elif anc.tag == _W_TR:
+            tr = anc
+        elif anc.tag == _W_TBL:
+            tbl = anc
+            break  # outermost table is enough
+    if tbl is None or tr is None or tc is None:
+        return None
+
+    def _index(el, tag):
+        return sum(1 for s in el.itersiblings(preceding=True) if s.tag == tag)
+
+    return f"tbl{_index(tbl, _W_TBL)}.r{_index(tr, _W_TR)}.c{_index(tc, _W_TC)}"
+
+
+def _location_for(key, fallback_index: int, file_type: str) -> str:
+    """Build a segment location. DOCX table cells carry ``tbl.r.c`` coordinates
+    so downstream context builders can reconstruct header/value pairs."""
+    part, container = key[0], key[1]
+    if file_type == ".docx" and container is not None:
+        coord = _docx_table_coordinate(container)
+        if coord is not None:
+            return f"{part}:{coord}"
+    return f"{part}:{fallback_index}"
+
 
 @register_processor
 class OOXMLDocumentProcessor(DocumentProcessor):
@@ -82,6 +121,7 @@ class OOXMLDocumentProcessor(DocumentProcessor):
         current_key = None
         buffer_parts: List[str] = []
         buffer_nodes: List[any] = []
+        file_type = getattr(self._processor, "file_type", self.file_path.suffix.lower())
 
         def flush(location: str):
             nonlocal current_offset, buffer_parts, buffer_nodes
@@ -108,13 +148,13 @@ class OOXMLDocumentProcessor(DocumentProcessor):
             if current_key is None:
                 current_key = key
             if key != current_key:
-                flush(location=f"{current_key[0]}:{len(self._segments)}")
+                flush(location=_location_for(current_key, len(self._segments), file_type))
                 current_key = key
             buffer_parts.append(node.text)
             buffer_nodes.append(node)
 
         if current_key is not None:
-            flush(location=f"{current_key[0]}:{len(self._segments)}")
+            flush(location=_location_for(current_key, len(self._segments), file_type))
         
         return self._segments
     

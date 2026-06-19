@@ -10,7 +10,7 @@ Automatically mask sensitive information before AI processing, then restore afte
 
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](https://opensource.org/licenses/MIT)
-[![Tests](https://img.shields.io/badge/tests-50%20passed-brightgreen.svg)]()
+[![Tests](https://img.shields.io/badge/tests-169%20passed-brightgreen.svg)]()
 
 [Features](#-features) • [Quick Start](#-quick-start) • [Documentation](#-documentation) • [Architecture](#-architecture)
 
@@ -34,7 +34,7 @@ When using AI tools (Claude, ChatGPT, Copilot) with sensitive documents, private
 | 🔒 **Auto Detection** | Hybrid detection with schema rules, regex, OpenAI Privacy Filter native spans, Qwen, and Presidio |
 | 📐 **Format Aware** | Structured values keep useful shape where possible; names use clear typed tokens |
 | 🔓 **Lossless Restore** | Perfect roundtrip: mask → AI → restore = original |
-| 💾 **Secure Vault** | SQLite storage outside project directory |
+| 💾 **Hardened Vault** | Versioned AES-256-GCM, native OS keyring, tamper/rollback checks, recovery, and rotation |
 | 🌐 **Web UI** | Modern drag-and-drop interface |
 | 📄 **Office Support** | DOCX, XLSX, PPTX, PDF with lossless processing |
 | ⚡ **High Performance** | 100K chars in < 2 seconds |
@@ -66,10 +66,30 @@ and regex layers remain enabled for structured Office files and Chinese tabular 
 The CLI loads the model for the current command and exits after processing; it does not
 run a background service.
 
-```bash
-# Default: hybrid detector with MLX Privacy Filter backend
-vibemask mask document.docx
+The recommended default command is simply:
 
+```bash
+# Default: hybrid detector with MLX Privacy Filter backend + viterbi decode
+vibemask mask document.docx
+```
+
+This default path has been validated on real Chinese Office documents (student lists,
+faculty lists, legacy `.xls` admission lists) with ≥99.6% recall / 100% precision for
+actual PII values, zero residual PII in masked output, and lossless roundtrip restore.
+
+Platform exceptions:
+
+```bash
+# Linux / Windows / Intel Mac: MLX is unavailable, use the native OPF backend
+vibemask mask document.docx --privacy-backend opf
+
+# Fully offline / no model environment: fast deterministic rules only
+vibemask mask document.docx --engine regex
+```
+
+Other baseline engines:
+
+```bash
 # Run only OpenAI Privacy Filter when you need a pure OPF baseline
 vibemask mask document.docx --engine privacy-filter --privacy-device cpu
 
@@ -176,15 +196,32 @@ original = vault.get_mapping_by_masked(masked)  # Returns "张三"
 
 ## 📊 Supported PII Types
 
-| Type | Example | Masked | Format Strategy |
-|------|---------|--------|------------------|
-| 姓名 (PERSON) | 张三 | {{PERSON_000001}} | Typed opaque token |
-| 电话 (PHONE) | 138-1234-5678 | 130-0000-0000 | Separator-preserving |
-| 邮箱 (EMAIL) | test@example.com | u001@example.com | Domain-preserving |
-| 身份证 (IDCN) | 110101198801011234 | 110101198001010002 | Length-preserving |
-| 地址 (ADDRESS) | 北京市朝阳区xxx路123号 | 某某某某某某XXX某000某 | Length-aware |
-| 日期 (DATE) | 2024-01-15 | 0000-00-00 | Format-preserving |
-| URL | https://example.com/user | https://example.com/U001 | URL-shaped |
+Every mask is a **type-preserving token** so a downstream LLM knows what field it
+stands for (and processes it accordingly) instead of discarding it as noise:
+
+```
+{{<TYPE>_<NNNNNN>:<shape>}}
+```
+
+`TYPE` names the field; `shape` is a **fully redacted** template of the original
+(digit → `#`, ASCII letter → `X`, CJK → `某`; separators kept). No original
+character survives, yet the shape tells the LLM "this is a phone / an 18-digit
+ID / …". The whole token is the vault key, so masking is losslessly reversible.
+Names/organizations carry no useful shape, so they use a bare typed token.
+
+| Type | Example | Masked |
+|------|---------|--------|
+| 姓名 (PERSON) | 张三 | `{{PERSON_000001}}` |
+| 电话 (PHONE) | 138-1234-5678 | `{{PHONE_000001:###-####-####}}` |
+| 邮箱 (EMAIL) | test@example.com | `{{EMAIL_000001:XXXX@XXXXXXX.XXX}}` |
+| 身份证 (IDCN) | 110101198801011234 | `{{IDCN_000001:##################}}` |
+| 地址 (ADDRESS) | 北京市朝阳区xxx路123号 | `{{ADDRESS_000001:某某某某某某XXX某###某}}` |
+| 日期 (DATE) | 2024-01-15 | `{{DATE_000001:####-##-##}}` |
+| URL | https://example.com/user | `{{URL_000001:XXXXX://XXXXXXX.XXX/XXXX}}` |
+
+**Identifier policy**: personal identifiers — 工号/学号/准考证号/客户编号/会员号/卡号/病历号 —
+are masked (the label word stays in the text, e.g. `工号 {{ACCOUNT_001:X######}}`).
+Transaction references — 订单号/合同号/发票号/流水号 — are not personal data and are dropped.
 
 ## 🏗 Architecture
 
@@ -204,7 +241,7 @@ vibemask/
 │   ├── presidio_engine.py  # Rule-based detection (Presidio)
 │   └── smart_detector.py   # Chinese name detection (Jieba + spaCy)
 ├── masker/
-│   └── placeholder.py      # Length-preserving placeholder generation
+│   └── placeholder.py      # Type-preserving {{TYPE:shape}} placeholders
 ├── vault/
 │   └── storage.py          # SQLite vault for mapping persistence
 ├── restore/
@@ -214,6 +251,27 @@ vibemask/
 │   └── server.py           # Web server
 └── cli.py                  # CLI interface (Typer)
 ```
+
+```
+eval/                      # Detection accuracy harness (golden dataset + P/R/F1)
+├── metrics.py             # Per-type Precision/Recall/F1 + FP/FN detail
+├── golden.py              # Golden dataset (substring-annotated, offset-validated)
+└── runner.py              # `python -m eval.runner --engine hybrid`
+```
+
+### Accuracy
+
+Detection accuracy is measured against a golden dataset and tracked in
+[`eval/reports/BASELINE.md`](eval/reports/BASELINE.md). Current hybrid (MLX
+Privacy Filter + deterministic layers) on the golden set:
+
+| | Precision | Recall | F1 |
+|---|---:|---:|---:|
+| hybrid | 84.7% | 96.2% | 90.1% |
+| deterministic (no model) | 89.5% | 73.9% | 81.0% |
+
+Run it yourself: `HF_HUB_OFFLINE=1 python -m eval.runner --engine hybrid`
+(model cached locally; set `HF_HUB_OFFLINE=1` when the network is flaky).
 
 ### Detection Pipeline
 
@@ -292,7 +350,7 @@ whitelist:
   - 公司名称
 ```
 
-## 📊 Data Storage
+## 📊 Vault Security and Data Storage
 
 Mappings are stored outside your project for security:
 
@@ -302,6 +360,51 @@ Mappings are stored outside your project for security:
 │   └── vault.sqlite      # Mapping database
 └── logs/
 ```
+
+Reversible values, session mappings, and source/output file names use versioned
+AES-256-GCM envelopes. Authentication data binds each field to its project, row,
+field, and key version. Each project has independent encryption and integrity
+keys. Production accepts only macOS Keychain, Windows Credential Manager, and
+Linux Secret Service; null, plaintext, fallback, chained, and unknown keyring
+backends fail closed. Linux desktop installs must have a working Secret Service
+session such as GNOME Keyring or KWallet integration.
+
+The SQLite database contains an authenticated logical manifest and HMAC audit
+chain. The newest epoch and chain head are anchored in the OS keyring, allowing
+VibeMask to reject field changes, row deletion/replay, audit truncation, and
+rollback to an older completed database transaction. High-volume masking writes
+are committed as one Vault transaction and one keyring checkpoint.
+
+Existing plaintext or v1 vault fields are migrated transactionally to v2 without
+printing values or creating a plaintext backup. If a required key, trusted state,
+or approved keyring backend is unavailable, VibeMask refuses to decrypt or write.
+
+Create a recovery bundle before relying on a Vault, and create a new one after
+every rotation:
+
+```bash
+vibemask vault security-status --project-root /path/to/project
+vibemask vault verify --project-root /path/to/project
+vibemask vault backup-key --project-root /path/to/project --output recovery.json
+vibemask vault rotate-key --project-root /path/to/project
+vibemask vault restore-key recovery.json --project-root /path/to/project
+```
+
+Recovery bundles contain the encryption key, independent integrity key, and
+trusted state inside Scrypt-derived AES-GCM authenticated encryption. Passphrases
+must contain at least 12 characters and are entered through hidden prompts; bundle
+files are atomically written with mode `0600` on POSIX. Store the bundle and its
+passphrase separately.
+
+This is a production-oriented **local single-user** threat model. It protects a
+copied current database from offline disclosure and detects authenticated-data
+tampering and completed-transaction rollback. It does not protect against malware
+or AI tooling already controlling the same user/process, nor plaintext remnants in
+filesystem snapshots, swap, crash dumps, Time Machine/cloud history, or historical
+backups. Those risks require OS/user isolation and encrypted storage/backup policy.
+
+See [the roadmap](docs/ROADMAP.md) for platform release checks and remaining
+document-processing/deployment work.
 
 ## 🧪 Testing
 
