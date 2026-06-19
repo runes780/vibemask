@@ -19,6 +19,7 @@ from .crypto import (
     VaultCipher,
 )
 from .keyring_policy import NativeKeyringStore, SecureKeyStore, resolve_encryption_key
+from .locking import VaultFileLock, assert_no_stale_sidecars
 
 
 ENCRYPTION_VERSION = 2
@@ -104,6 +105,7 @@ class VaultStorage:
         
         # Ensure directory exists
         self.vault_path.parent.mkdir(parents=True, exist_ok=True)
+        self._lock = VaultFileLock(Path(f"{self.vault_path}.lock"))
         self._ensure_private_permissions()
         
         # Initialize database
@@ -142,9 +144,23 @@ class VaultStorage:
             except OSError:
                 pass
     
+    def _connect(self) -> sqlite3.Connection:
+        """Open SQLite with the vault's required durability and privacy settings."""
+        conn = sqlite3.connect(self.vault_path, timeout=5.0)
+        conn.execute("PRAGMA busy_timeout = 5000")
+        conn.execute("PRAGMA foreign_keys = ON")
+        conn.execute("PRAGMA secure_delete = ON")
+        conn.execute("PRAGMA journal_mode = DELETE")
+        return conn
+
     def _init_db(self):
+        with self._lock:
+            assert_no_stale_sidecars(self.vault_path)
+            self._init_db_unlocked()
+
+    def _init_db_unlocked(self):
         """Initialize database schema."""
-        conn = sqlite3.connect(self.vault_path)
+        conn = self._connect()
         
         # Mappings table
         conn.execute('''
@@ -202,7 +218,7 @@ class VaultStorage:
 
     def _contains_encrypted_data(self) -> bool:
         """Check only ciphertext markers; never load or expose stored plaintext."""
-        conn = sqlite3.connect(self.vault_path)
+        conn = self._connect()
         try:
             prefixes = (f"{LEGACY_CIPHERTEXT_PREFIX}%", f"{CIPHERTEXT_PREFIX}%")
             mapping = conn.execute(
@@ -270,8 +286,13 @@ class VaultStorage:
         return mapping is not None or session is not None
 
     def _migrate_sensitive_fields(self) -> None:
+        with self._lock:
+            assert_no_stale_sidecars(self.vault_path)
+            self._migrate_sensitive_fields_unlocked()
+
+    def _migrate_sensitive_fields_unlocked(self) -> None:
         """Encrypt every legacy sensitive value in one idempotent transaction."""
-        conn = sqlite3.connect(self.vault_path)
+        conn = self._connect()
         migrated_plaintext = False
         try:
             if not self._migration_required(conn):
@@ -341,7 +362,7 @@ class VaultStorage:
             conn.close()
 
         if migrated_plaintext:
-            vacuum = sqlite3.connect(self.vault_path)
+            vacuum = self._connect()
             try:
                 vacuum.execute("PRAGMA secure_delete = ON")
                 vacuum.execute("VACUUM")
@@ -356,11 +377,25 @@ class VaultStorage:
         source: str = "unknown",
         confidence: float = 1.0
     ) -> str:
+        with self._lock:
+            assert_no_stale_sidecars(self.vault_path)
+            return self._get_or_create_mapping_unlocked(
+                original, entity_type, masked, source, confidence
+            )
+
+    def _get_or_create_mapping_unlocked(
+        self,
+        original: str,
+        entity_type: str,
+        masked: str,
+        source: str = "unknown",
+        confidence: float = 1.0,
+    ) -> str:
         """
         Get existing mapping or create new one.
         Ensures stable mappings within a project.
         """
-        conn = sqlite3.connect(self.vault_path)
+        conn = self._connect()
         cursor = conn.cursor()
 
         original_digest = self._cipher.lookup_digest(original, "mapping-original")
@@ -474,7 +509,7 @@ class VaultStorage:
     
     def get_mapping_by_masked(self, masked: str) -> Optional[str]:
         """Get original text for a masked value."""
-        conn = sqlite3.connect(self.vault_path)
+        conn = self._connect()
         cursor = conn.cursor()
         
         cursor.execute('''
@@ -491,7 +526,7 @@ class VaultStorage:
     
     def get_all_mappings(self) -> Dict[str, str]:
         """Get all mappings for the project {masked -> original}."""
-        conn = sqlite3.connect(self.vault_path)
+        conn = self._connect()
         cursor = conn.cursor()
         
         cursor.execute('''
@@ -517,13 +552,27 @@ class VaultStorage:
         output_files: Optional[List[str]] = None,
         status: str = "pending",
     ) -> str:
+        with self._lock:
+            assert_no_stale_sidecars(self.vault_path)
+            return self._create_session_unlocked(
+                input_files, mappings, stats, output_files, status
+            )
+
+    def _create_session_unlocked(
+        self,
+        input_files: List[str],
+        mappings: Dict[str, str],
+        stats: Dict[str, int],
+        output_files: Optional[List[str]] = None,
+        status: str = "pending",
+    ) -> str:
         """Create a new masking session."""
         session_id = str(uuid.uuid4())[:8]  # Short ID for display
         now = datetime.now().isoformat()
         if output_files is None:
             output_files = []
         
-        conn = sqlite3.connect(self.vault_path)
+        conn = self._connect()
         cursor = conn.cursor()
         
         cursor.execute('''
@@ -548,7 +597,7 @@ class VaultStorage:
     
     def get_session(self, session_id: str) -> Optional[Session]:
         """Get session by ID."""
-        conn = sqlite3.connect(self.vault_path)
+        conn = self._connect()
         cursor = conn.cursor()
         
         cursor.execute('''
@@ -576,7 +625,7 @@ class VaultStorage:
     
     def list_sessions(self, limit: int = 50) -> List[Session]:
         """List recent sessions."""
-        conn = sqlite3.connect(self.vault_path)
+        conn = self._connect()
         cursor = conn.cursor()
         
         cursor.execute('''
@@ -609,7 +658,7 @@ class VaultStorage:
         # Normalize path
         abs_path = str(Path(file_path).absolute())
         
-        conn = sqlite3.connect(self.vault_path)
+        conn = self._connect()
         cursor = conn.cursor()
         
         # Search recent sessions
@@ -650,8 +699,18 @@ class VaultStorage:
         status: str,
         output_files: Optional[List[str]] = None
     ):
+        with self._lock:
+            assert_no_stale_sidecars(self.vault_path)
+            self._update_session_status_unlocked(session_id, status, output_files)
+
+    def _update_session_status_unlocked(
+        self,
+        session_id: str,
+        status: str,
+        output_files: Optional[List[str]] = None,
+    ):
         """Update session status."""
-        conn = sqlite3.connect(self.vault_path)
+        conn = self._connect()
         cursor = conn.cursor()
         
         if output_files is not None:
@@ -673,7 +732,7 @@ class VaultStorage:
     
     def get_stats(self) -> Dict:
         """Get vault statistics."""
-        conn = sqlite3.connect(self.vault_path)
+        conn = self._connect()
         cursor = conn.cursor()
         
         # Count mappings by type
