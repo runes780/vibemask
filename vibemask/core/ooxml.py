@@ -6,12 +6,10 @@ Supports: DOCX, XLSX, PPTX
 """
 
 import zipfile
-import os
 import shutil
 from pathlib import Path
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Optional
 from dataclasses import dataclass
-from io import BytesIO
 
 try:
     from lxml import etree
@@ -369,6 +367,7 @@ def mask_ooxml_file(
     
     # Initialize replacements dictionary
     replacements = {}
+    mapping_candidates = {}
     stats = {}
     
     input_path = Path(input_path)
@@ -391,14 +390,8 @@ def mask_ooxml_file(
             # Use LLM mappings directly
             for orig, proposed in llm_result.mappings.items():
                 pii_type = llm_result.pii_types.get(orig, "UNKNOWN")
-                final_mask = vault.get_or_create_mapping(
-                    original=orig,
-                    entity_type=pii_type,
-                    masked=proposed,
-                    source="llm_scan",
-                    confidence=1.0,
-                )
-                replacements[orig] = final_mask
+                mapping_candidates[orig] = (pii_type, proposed, "llm_scan", 1.0)
+                replacements[orig] = proposed
             
             # Convert types for stats
             for orig, pii_type in llm_result.pii_types.items():
@@ -448,14 +441,13 @@ def mask_ooxml_file(
         # Refinement: Check if the exact text is already in replacements
         if span.text not in replacements:
             proposed = generator.generate(span.text, span.type)
-            final_mask = vault.get_or_create_mapping(
-                original=span.text,
-                entity_type=span.type.value,
-                masked=proposed,
-                source=span.source.value,
-                confidence=span.confidence,
+            mapping_candidates[span.text] = (
+                span.type.value,
+                proposed,
+                span.source.value,
+                span.confidence,
             )
-            replacements[span.text] = final_mask
+            replacements[span.text] = proposed
             stats[span.type.value] = stats.get(span.type.value, 0) + 1
     
     result = {
@@ -469,17 +461,27 @@ def mask_ooxml_file(
         result["replacements"] = replacements
         return result
     
-    # Apply replacements
-    processor.replace_in_place(replacements)
-    
-    # Save
-    if output_path is None:
-        output_path = input_path.with_stem(input_path.stem + "_masked")
-    processor.save(output_path)
-    
-    # Store mappings in vault session
-    mappings = {v: k for k, v in replacements.items()}  # {masked -> original}
-    session_id = vault.create_session([str(input_path)], mappings, stats, output_files=[str(output_path)])
+    with vault.batch("mask-session"):
+        for original, candidate in mapping_candidates.items():
+            entity_type, proposed, source, confidence = candidate
+            replacements[original] = vault.get_or_create_mapping(
+                original=original,
+                entity_type=entity_type,
+                masked=proposed,
+                source=source,
+                confidence=confidence,
+            )
+
+        processor.replace_in_place(replacements)
+
+        if output_path is None:
+            output_path = input_path.with_stem(input_path.stem + "_masked")
+        processor.save(output_path)
+
+        mappings = {v: k for k, v in replacements.items()}
+        session_id = vault.create_session(
+            [str(input_path)], mappings, stats, output_files=[str(output_path)]
+        )
     
     result["session_id"] = session_id
     result["output"] = str(output_path)

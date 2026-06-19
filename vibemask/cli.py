@@ -396,6 +396,7 @@ def mask(
         generator = PlaceholderGenerator()
         
         replacements = {}
+        mapping_candidates = {}
         stats = {}
         seen_entities = set()
         
@@ -420,16 +421,13 @@ def mask(
                 
             proposed_mask = generator.generate(original, etype_enum)
             
-            # Get consistent mask from vault
-            final_mask = vault.get_or_create_mapping(
-                original=original,
-                entity_type=entity_type, 
-                masked=proposed_mask,
-                source=res.source,
-                confidence=res.score
+            mapping_candidates[original] = (
+                entity_type,
+                proposed_mask,
+                res.source,
+                res.score,
             )
-            
-            replacements[original] = final_mask
+            replacements[original] = proposed_mask
         
         # 4. Preview
         table = Table(title=f"🔍 Detected in {original_file.name}")
@@ -461,6 +459,17 @@ def mask(
         if interactive:
             if not typer.confirm("Proceed with masking?"):
                 raise typer.Exit(0)
+
+        stack.enter_context(vault.batch("mask-session"))
+        for original, candidate in mapping_candidates.items():
+            entity_type, proposed_mask, source, confidence = candidate
+            replacements[original] = vault.get_or_create_mapping(
+                original=original,
+                entity_type=entity_type,
+                masked=proposed_mask,
+                source=source,
+                confidence=confidence,
+            )
             
         # 5. Apply Replacements
         try:

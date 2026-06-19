@@ -139,38 +139,40 @@ async def mask_file(
         replacements = {}
         stats = {}
         
-        for span in spans:
-            original = span.text
-            entity_type = span.type.value
-            stats[entity_type] = stats.get(entity_type, 0) + 1
-            
-            if original in replacements:
-                continue
-                
-            try:
-                etype = EntityType(entity_type)
-            except ValueError:
-                etype = EntityType.UNKNOWN
-            
-            proposed = generator.generate(original, etype)
-            final = vault.get_or_create_mapping(
-                original, entity_type, proposed,
-                source=span.source.value, confidence=span.confidence
+        with vault.batch("mask-session"):
+            for span in spans:
+                original = span.text
+                entity_type = span.type.value
+                stats[entity_type] = stats.get(entity_type, 0) + 1
+
+                if original in replacements:
+                    continue
+
+                try:
+                    etype = EntityType(entity_type)
+                except ValueError:
+                    etype = EntityType.UNKNOWN
+
+                proposed = generator.generate(original, etype)
+                final = vault.get_or_create_mapping(
+                    original,
+                    entity_type,
+                    proposed,
+                    source=span.source.value,
+                    confidence=span.confidence,
+                )
+                replacements[original] = final
+
+            apply_processor_replacements(processor, replacements, spans)
+            processor.save(masked_path)
+
+            reverse_map = {v: k for k, v in replacements.items()}
+            session_id = vault.create_session(
+                input_files=[file.filename],
+                output_files=[str(masked_path)],
+                mappings=reverse_map,
+                stats=stats,
             )
-            replacements[original] = final
-            
-        # Apply
-        apply_processor_replacements(processor, replacements, spans)
-        processor.save(masked_path)
-        
-        # Save Session
-        reverse_map = {v: k for k, v in replacements.items()}
-        # Use simple filename for local session tracking
-        session_id = vault.create_session(
-            input_files=[file.filename],
-            mappings=reverse_map,
-            stats=stats
-        )
         
         # Preview data
         preview = [

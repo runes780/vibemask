@@ -9,6 +9,8 @@ import json
 import os
 import secrets
 import uuid
+import threading
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -19,6 +21,7 @@ from .crypto import (
     LEGACY_CIPHERTEXT_PREFIX,
     VaultCipher,
     VaultKeyMissingError,
+    parse_envelope,
 )
 from .integrity import (
     VaultIntegrityError,
@@ -110,6 +113,9 @@ class VaultStorage:
         self.vault_path = get_vault_path(project_path)
         self.key_store = key_store or default_key_store()
         self.key_provider = self.key_store
+        self._batch_conn: sqlite3.Connection | None = None
+        self._batch_failed = False
+        self._batch_owner: int | None = None
         
         # Ensure directory exists
         self.vault_path.parent.mkdir(parents=True, exist_ok=True)
@@ -324,7 +330,11 @@ class VaultStorage:
             for entity_id, original_text, original_digest in mapping_rows:
                 context = self._mapping_context(entity_id)
                 if self._cipher.is_encrypted(original_text):
+                    envelope = parse_envelope(original_text)
                     plaintext = self._cipher.decrypt(original_text, context)
+                    if envelope.version != 2:
+                        original_text = self._cipher.encrypt(plaintext, context)
+                        migrated_plaintext = True
                 else:
                     plaintext = original_text
                     original_text = self._cipher.encrypt(plaintext, context)
@@ -348,8 +358,17 @@ class VaultStorage:
                 encrypted_values = {}
                 for field, value in values.items():
                     if self._cipher.is_encrypted(value):
-                        self._cipher.decrypt(value, self._session_context(session_id, field))
-                        encrypted_values[field] = value
+                        envelope = parse_envelope(value)
+                        plaintext = self._cipher.decrypt(
+                            value, self._session_context(session_id, field)
+                        )
+                        if envelope.version == 2:
+                            encrypted_values[field] = value
+                        else:
+                            encrypted_values[field] = self._cipher.encrypt(
+                                plaintext, self._session_context(session_id, field)
+                            )
+                            migrated_plaintext = True
                     else:
                         encrypted_values[field] = self._cipher.encrypt(
                             value, self._session_context(session_id, field)
@@ -471,6 +490,10 @@ class VaultStorage:
 
     def _verified_write(self, operation: str, callback):
         """Commit one mutation and its audit checkpoint atomically."""
+        if self._batch_conn is not None:
+            if self._batch_owner != threading.get_ident():
+                raise RuntimeError("A vault batch cannot be shared across threads.")
+            return callback(self._batch_conn)
         with self._lock:
             assert_no_stale_sidecars(self.vault_path)
             conn = self._connect()
@@ -493,6 +516,53 @@ class VaultStorage:
                 conn.close()
             self.key_store.set_trusted_state(self.project_id, state)
             return result
+
+    @contextmanager
+    def batch(self, operation: str = "batch"):
+        """Group all enclosed writes into one SQLite commit and keyring checkpoint."""
+        owner = threading.get_ident()
+        if self._batch_conn is not None:
+            if self._batch_owner != owner:
+                raise RuntimeError("A vault batch cannot be shared across threads.")
+            try:
+                yield self
+            except Exception:
+                self._batch_failed = True
+                raise
+            return
+
+        with self._lock:
+            assert_no_stale_sidecars(self.vault_path)
+            conn = self._connect()
+            state = None
+            committed = False
+            try:
+                trusted = self._verify_connection(conn)
+                conn.execute("BEGIN IMMEDIATE")
+                self._batch_conn = conn
+                self._batch_owner = owner
+                self._batch_failed = False
+                yield self
+                if self._batch_failed:
+                    raise RuntimeError("The vault batch was marked failed by a nested operation.")
+                state = append_integrity_checkpoint(
+                    conn,
+                    self._integrity_key,
+                    operation,
+                    recovery_key_version=trusted.recovery_key_version,
+                )
+                conn.commit()
+                committed = True
+            except Exception:
+                if not committed:
+                    conn.rollback()
+                raise
+            finally:
+                self._batch_conn = None
+                self._batch_owner = None
+                self._batch_failed = False
+                conn.close()
+            self.key_store.set_trusted_state(self.project_id, state)
     
     def get_or_create_mapping(
         self,

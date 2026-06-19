@@ -6,8 +6,6 @@ Supports: .docx, .xlsx, .pptx
 from pathlib import Path
 from typing import List, Tuple, Optional
 from dataclasses import dataclass
-import tempfile
-import shutil
 
 
 @dataclass
@@ -79,8 +77,6 @@ def write_docx(doc: any, file_path: Path, replacements: dict):
         file_path: Output path
         replacements: Dict of {original -> masked}
     """
-    from docx import Document
-    
     # Replace in paragraphs
     for para in doc.paragraphs:
         for original, masked in replacements.items():
@@ -284,7 +280,6 @@ def mask_office_file(
         Dict with masking results
     """
     from ..core.merger import merge_spans
-    from ..core.replacer import Replacement, apply_replacements
     from ..detector.regex import detect_by_regex
     from ..detector.heuristic import detect_chinese_names
     from ..masker.placeholder import PlaceholderGenerator
@@ -335,12 +330,24 @@ def mask_office_file(
     if output_path is None:
         output_path = input_path
     
-    write_office_file(doc, output_path, replacements, input_path.suffix.lower())
-    
-    # Store mappings in vault
     vault = VaultStorage(str(input_path.parent))
-    mappings = {v: k for k, v in replacements.items()}  # Reverse for restoration
-    session_id = vault.create_session([str(input_path)], mappings, stats)
+    with vault.batch("mask-session"):
+        for span in final_spans:
+            proposed = replacements[span.text]
+            replacements[span.text] = vault.get_or_create_mapping(
+                original=span.text,
+                entity_type=span.type.value,
+                masked=proposed,
+                source=span.source.value,
+                confidence=span.confidence,
+            )
+
+        write_office_file(doc, output_path, replacements, input_path.suffix.lower())
+
+        mappings = {v: k for k, v in replacements.items()}
+        session_id = vault.create_session(
+            [str(input_path)], mappings, stats, output_files=[str(output_path)]
+        )
     
     result["session_id"] = session_id
     result["output"] = str(output_path)
