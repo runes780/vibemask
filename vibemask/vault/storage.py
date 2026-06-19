@@ -7,6 +7,7 @@ import sqlite3
 import hashlib
 import json
 import os
+import secrets
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -17,6 +18,13 @@ from .crypto import (
     CIPHERTEXT_PREFIX,
     LEGACY_CIPHERTEXT_PREFIX,
     VaultCipher,
+    VaultKeyMissingError,
+)
+from .integrity import (
+    VaultIntegrityError,
+    append_integrity_checkpoint,
+    compare_with_trusted_state,
+    validate_database,
 )
 from .keyring_policy import NativeKeyringStore, SecureKeyStore, resolve_encryption_key
 from .locking import VaultFileLock, assert_no_stale_sidecars
@@ -119,6 +127,7 @@ class VaultStorage:
         )
         self._cipher = VaultCipher(key, self.project_id, key_version=1)
         self._migrate_sensitive_fields()
+        self._initialize_integrity()
         self._ensure_private_permissions()
 
     def _ensure_private_permissions(self):
@@ -196,6 +205,16 @@ class VaultStorage:
             CREATE TABLE IF NOT EXISTS vault_meta (
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL
+            )
+        ''')
+
+        conn.execute('''
+            CREATE TABLE IF NOT EXISTS vault_audit (
+                epoch INTEGER PRIMARY KEY,
+                previous_head TEXT NOT NULL,
+                manifest TEXT NOT NULL,
+                operation TEXT NOT NULL,
+                head TEXT NOT NULL
             )
         ''')
 
@@ -368,6 +387,112 @@ class VaultStorage:
                 vacuum.execute("VACUUM")
             finally:
                 vacuum.close()
+
+    def _initialize_integrity(self) -> None:
+        """Bootstrap or verify the keyring-anchored logical audit history."""
+        with self._lock:
+            assert_no_stale_sidecars(self.vault_path)
+            conn = self._connect()
+            try:
+                audit_count = conn.execute("SELECT COUNT(*) FROM vault_audit").fetchone()[0]
+                trusted = self.key_store.get_trusted_state(self.project_id)
+                integrity_key = self.key_store.get_integrity_key(self.project_id)
+                if audit_count:
+                    if integrity_key is None:
+                        raise VaultKeyMissingError(
+                            "This vault has an audit history, but its integrity key is missing."
+                        )
+                    if trusted is None:
+                        raise VaultIntegrityError(
+                            "This audited vault is missing its keyring trusted state."
+                        )
+                    self._integrity_key = integrity_key
+                    current = validate_database(conn, integrity_key)
+                    resolved = compare_with_trusted_state(conn, current, trusted)
+                    if resolved != trusted:
+                        self.key_store.set_trusted_state(self.project_id, resolved)
+                    self.active_key_version = resolved.active_key_version
+                    return
+
+                if trusted is not None:
+                    raise VaultIntegrityError(
+                        "The vault audit history is missing but trusted state already exists."
+                    )
+                if integrity_key is None:
+                    integrity_key = secrets.token_bytes(32)
+                    self.key_store.set_integrity_key(self.project_id, integrity_key)
+                self._integrity_key = integrity_key
+                conn.execute("BEGIN IMMEDIATE")
+                database_id = str(uuid.uuid4())
+                conn.execute(
+                    "INSERT OR REPLACE INTO vault_meta(key, value) VALUES ('database_id', ?)",
+                    (database_id,),
+                )
+                conn.execute(
+                    "INSERT OR REPLACE INTO vault_meta(key, value) "
+                    "VALUES ('active_key_version', '1')"
+                )
+                state = append_integrity_checkpoint(conn, integrity_key, "bootstrap")
+                conn.commit()
+                self.key_store.set_trusted_state(self.project_id, state)
+                self.active_key_version = 1
+            except Exception:
+                conn.rollback()
+                raise
+            finally:
+                conn.close()
+
+    def _verify_connection(self, conn: sqlite3.Connection):
+        trusted = self.key_store.get_trusted_state(self.project_id)
+        if trusted is None:
+            raise VaultIntegrityError("This audited vault is missing its keyring trusted state.")
+        current = validate_database(conn, self._integrity_key)
+        resolved = compare_with_trusted_state(conn, current, trusted)
+        if resolved != trusted:
+            self.key_store.set_trusted_state(self.project_id, resolved)
+        return resolved
+
+    def verify(self) -> Dict:
+        """Verify authenticated contents and the rollback anchor without decrypting values."""
+        with self._lock:
+            conn = self._connect()
+            try:
+                state = self._verify_connection(conn)
+                return {
+                    "verified": True,
+                    "database_id": state.database_id,
+                    "active_key_version": state.active_key_version,
+                    "epoch": state.epoch,
+                    "manifest": state.manifest,
+                    "chain_head": state.chain_head,
+                }
+            finally:
+                conn.close()
+
+    def _verified_write(self, operation: str, callback):
+        """Commit one mutation and its audit checkpoint atomically."""
+        with self._lock:
+            assert_no_stale_sidecars(self.vault_path)
+            conn = self._connect()
+            state = None
+            try:
+                trusted = self._verify_connection(conn)
+                conn.execute("BEGIN IMMEDIATE")
+                result = callback(conn)
+                state = append_integrity_checkpoint(
+                    conn,
+                    self._integrity_key,
+                    operation,
+                    recovery_key_version=trusted.recovery_key_version,
+                )
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+            finally:
+                conn.close()
+            self.key_store.set_trusted_state(self.project_id, state)
+            return result
     
     def get_or_create_mapping(
         self,
@@ -377,14 +502,16 @@ class VaultStorage:
         source: str = "unknown",
         confidence: float = 1.0
     ) -> str:
-        with self._lock:
-            assert_no_stale_sidecars(self.vault_path)
-            return self._get_or_create_mapping_unlocked(
-                original, entity_type, masked, source, confidence
-            )
+        return self._verified_write(
+            "upsert-mapping",
+            lambda conn: self._get_or_create_mapping_unlocked(
+                conn, original, entity_type, masked, source, confidence
+            ),
+        )
 
     def _get_or_create_mapping_unlocked(
         self,
+        conn: sqlite3.Connection,
         original: str,
         entity_type: str,
         masked: str,
@@ -395,7 +522,6 @@ class VaultStorage:
         Get existing mapping or create new one.
         Ensures stable mappings within a project.
         """
-        conn = self._connect()
         cursor = conn.cursor()
 
         original_digest = self._cipher.lookup_digest(original, "mapping-original")
@@ -410,14 +536,11 @@ class VaultStorage:
         if row:
             stored_original = self._cipher.decrypt(row[2], self._mapping_context(row[1]))
             if stored_original != original:
-                conn.close()
                 raise RuntimeError("Vault mapping digest collision detected.")
             # Update last_seen_at
             cursor.execute('''
                 UPDATE mappings SET last_seen_at = ? WHERE entity_id = ?
             ''', (datetime.now().isoformat(), row[1]))
-            conn.commit()
-            conn.close()
             return row[0]
         
         def tweak_mask(value: str, attempt: int) -> str:
@@ -503,12 +626,11 @@ class VaultStorage:
         ''', (entity_id, self.project_id, entity_type, encrypted_original, original_digest,
               candidate_masked, now, now, source, confidence))
         
-        conn.commit()
-        conn.close()
         return candidate_masked
     
     def get_mapping_by_masked(self, masked: str) -> Optional[str]:
         """Get original text for a masked value."""
+        self.verify()
         conn = self._connect()
         cursor = conn.cursor()
         
@@ -526,6 +648,7 @@ class VaultStorage:
     
     def get_all_mappings(self) -> Dict[str, str]:
         """Get all mappings for the project {masked -> original}."""
+        self.verify()
         conn = self._connect()
         cursor = conn.cursor()
         
@@ -552,14 +675,16 @@ class VaultStorage:
         output_files: Optional[List[str]] = None,
         status: str = "pending",
     ) -> str:
-        with self._lock:
-            assert_no_stale_sidecars(self.vault_path)
-            return self._create_session_unlocked(
-                input_files, mappings, stats, output_files, status
-            )
+        return self._verified_write(
+            "create-session",
+            lambda conn: self._create_session_unlocked(
+                conn, input_files, mappings, stats, output_files, status
+            ),
+        )
 
     def _create_session_unlocked(
         self,
+        conn: sqlite3.Connection,
         input_files: List[str],
         mappings: Dict[str, str],
         stats: Dict[str, int],
@@ -572,7 +697,6 @@ class VaultStorage:
         if output_files is None:
             output_files = []
         
-        conn = self._connect()
         cursor = conn.cursor()
         
         cursor.execute('''
@@ -590,13 +714,11 @@ class VaultStorage:
             json.dumps(stats)
         ))
         
-        conn.commit()
-        conn.close()
-        
         return session_id
     
     def get_session(self, session_id: str) -> Optional[Session]:
         """Get session by ID."""
+        self.verify()
         conn = self._connect()
         cursor = conn.cursor()
         
@@ -625,6 +747,7 @@ class VaultStorage:
     
     def list_sessions(self, limit: int = 50) -> List[Session]:
         """List recent sessions."""
+        self.verify()
         conn = self._connect()
         cursor = conn.cursor()
         
@@ -655,6 +778,7 @@ class VaultStorage:
     
     def find_latest_session_for_file(self, file_path: str) -> Optional[Session]:
         """Find the latest session that processed the given file."""
+        self.verify()
         # Normalize path
         abs_path = str(Path(file_path).absolute())
         
@@ -699,18 +823,21 @@ class VaultStorage:
         status: str,
         output_files: Optional[List[str]] = None
     ):
-        with self._lock:
-            assert_no_stale_sidecars(self.vault_path)
-            self._update_session_status_unlocked(session_id, status, output_files)
+        self._verified_write(
+            "update-session-status",
+            lambda conn: self._update_session_status_unlocked(
+                conn, session_id, status, output_files
+            ),
+        )
 
     def _update_session_status_unlocked(
         self,
+        conn: sqlite3.Connection,
         session_id: str,
         status: str,
         output_files: Optional[List[str]] = None,
     ):
         """Update session status."""
-        conn = self._connect()
         cursor = conn.cursor()
         
         if output_files is not None:
@@ -727,11 +854,10 @@ class VaultStorage:
                 UPDATE sessions SET status = ? WHERE session_id = ?
             ''', (status, session_id))
         
-        conn.commit()
-        conn.close()
     
     def get_stats(self) -> Dict:
         """Get vault statistics."""
+        self.verify()
         conn = self._connect()
         cursor = conn.cursor()
         
@@ -770,3 +896,19 @@ class VaultStorage:
             "key_provider": self.key_provider.name,
             "encryption_version": int(version_row[0]) if version_row else 0,
         }
+
+    def security_status(self) -> Dict:
+        """Return security posture metadata without decrypting or exposing vault values."""
+        result = self.verify()
+        result.update(
+            {
+                "encryption": self._cipher.algorithm,
+                "key_provider": self.key_store.name,
+                "encryption_version": ENCRYPTION_VERSION,
+                "recovery_current": (
+                    self.key_store.get_trusted_state(self.project_id).recovery_key_version
+                    == result["active_key_version"]
+                ),
+            }
+        )
+        return result
