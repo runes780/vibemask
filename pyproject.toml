@@ -70,6 +70,8 @@ dev = [
     "pytest-asyncio>=0.21.0",
     "black>=23.0.0",
     "ruff>=0.1.0",
+    "pip-audit>=2.7.0",
+    "cyclonedx-bom>=4.5.0",
 ]
 
 # Standard installation (Office + Web)

@@ -34,7 +34,7 @@ When using AI tools (Claude, ChatGPT, Copilot) with sensitive documents, private
 | 🔒 **Auto Detection** | Hybrid detection with schema rules, regex, OpenAI Privacy Filter native spans, Qwen, and Presidio |
 | 📐 **Format Aware** | Structured values keep useful shape where possible; names use clear typed tokens |
 | 🔓 **Lossless Restore** | Perfect roundtrip: mask → AI → restore = original |
-| 💾 **Encrypted Vault** | AES-256-GCM field encryption with per-project keys in the OS keyring |
+| 💾 **Hardened Vault** | Versioned AES-256-GCM, native OS keyring, tamper/rollback checks, recovery, and rotation |
 | 🌐 **Web UI** | Modern drag-and-drop interface |
 | 📄 **Office Support** | DOCX, XLSX, PPTX, PDF with lossless processing |
 | ⚡ **High Performance** | 100K chars in < 2 seconds |
@@ -350,7 +350,7 @@ whitelist:
   - 公司名称
 ```
 
-## 📊 Data Storage
+## 📊 Vault Security and Data Storage
 
 Mappings are stored outside your project for security:
 
@@ -361,19 +361,49 @@ Mappings are stored outside your project for security:
 └── logs/
 ```
 
-Reversible values, session mappings, and source/output file names are encrypted
-with AES-256-GCM. Each project has an independent random key stored by the
-operating-system keyring (macOS Keychain, Windows Credential Manager, or the
-configured Linux secret-service backend). Generated placeholders and aggregate
-statistics remain plaintext because they do not contain original PII.
+Reversible values, session mappings, and source/output file names use versioned
+AES-256-GCM envelopes. Authentication data binds each field to its project, row,
+field, and key version. Each project has independent encryption and integrity
+keys. Production accepts only macOS Keychain, Windows Credential Manager, and
+Linux Secret Service; null, plaintext, fallback, chained, and unknown keyring
+backends fail closed. Linux desktop installs must have a working Secret Service
+session such as GNOME Keyring or KWallet integration.
 
-Existing plaintext vaults are migrated transactionally the first time they are
-opened by this version. Migration does not print values or create a plaintext
-backup. If the keyring is unavailable, or an encrypted vault's key has been
-deleted, VibeMask fails closed instead of creating or using a plaintext vault.
-Losing the key permanently makes that project's encrypted mappings impossible
-to restore, so Keychain/keyring backups must be included in the user's backup
-policy.
+The SQLite database contains an authenticated logical manifest and HMAC audit
+chain. The newest epoch and chain head are anchored in the OS keyring, allowing
+VibeMask to reject field changes, row deletion/replay, audit truncation, and
+rollback to an older completed database transaction. High-volume masking writes
+are committed as one Vault transaction and one keyring checkpoint.
+
+Existing plaintext or v1 vault fields are migrated transactionally to v2 without
+printing values or creating a plaintext backup. If a required key, trusted state,
+or approved keyring backend is unavailable, VibeMask refuses to decrypt or write.
+
+Create a recovery bundle before relying on a Vault, and create a new one after
+every rotation:
+
+```bash
+vibemask vault security-status --project-root /path/to/project
+vibemask vault verify --project-root /path/to/project
+vibemask vault backup-key --project-root /path/to/project --output recovery.json
+vibemask vault rotate-key --project-root /path/to/project
+vibemask vault restore-key recovery.json --project-root /path/to/project
+```
+
+Recovery bundles contain the encryption key, independent integrity key, and
+trusted state inside Scrypt-derived AES-GCM authenticated encryption. Passphrases
+are entered through hidden prompts; bundle files are atomically written with mode
+`0600` on POSIX. Store the bundle and its passphrase separately.
+
+This is a production-oriented **local single-user** threat model. It protects a
+copied current database from offline disclosure and detects authenticated-data
+tampering and completed-transaction rollback. It does not protect against malware
+or AI tooling already controlling the same user/process, nor plaintext remnants in
+filesystem snapshots, swap, crash dumps, Time Machine/cloud history, or historical
+backups. Those risks require OS/user isolation and encrypted storage/backup policy.
+
+See [the roadmap](docs/ROADMAP.md) for platform release checks and remaining
+document-processing/deployment work.
 
 ## 🧪 Testing
 
