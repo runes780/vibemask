@@ -13,6 +13,7 @@ from vibemask.vault.crypto import (
     VaultDecryptionError,
     VaultKeyMissingError,
     VaultKeyUnavailableError,
+    parse_envelope,
     resolve_vault_key,
 )
 from vibemask.vault.storage import VaultStorage, get_project_fingerprint, get_vault_path
@@ -64,9 +65,12 @@ def test_vault_cipher_rejects_wrong_key_and_wrong_aad():
 def test_vault_cipher_rejects_tampered_ciphertext():
     cipher = VaultCipher(b"c" * 32, "project-1")
     ciphertext = cipher.encrypt("SYNTHETIC-PII-003", "sessions:s1:mappings")
-    payload = bytearray(base64.urlsafe_b64decode(ciphertext.removeprefix(CIPHERTEXT_PREFIX)))
+    envelope = parse_envelope(ciphertext)
+    payload = bytearray(envelope.payload)
     payload[-1] ^= 1
-    tampered = CIPHERTEXT_PREFIX + base64.urlsafe_b64encode(payload).decode("ascii")
+    tampered = f"{CIPHERTEXT_PREFIX}{envelope.key_version}:" + base64.urlsafe_b64encode(
+        payload
+    ).decode("ascii")
 
     with pytest.raises(VaultDecryptionError):
         cipher.decrypt(tampered, "sessions:s1:mappings")

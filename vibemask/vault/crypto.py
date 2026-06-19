@@ -3,16 +3,19 @@
 from __future__ import annotations
 
 import base64
+import binascii
 import hashlib
 import hmac
 import secrets
+from dataclasses import dataclass
 from typing import Protocol
 
 from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 
-CIPHERTEXT_PREFIX = "vmenc:v1:"
+LEGACY_CIPHERTEXT_PREFIX = "vmenc:v1:"
+CIPHERTEXT_PREFIX = "vmenc:v2:"
 KEYRING_SERVICE = "vibemask"
 KEYRING_ACCOUNT_PREFIX = "vault:"
 KEY_SIZE = 32
@@ -33,6 +36,45 @@ class VaultKeyMissingError(VaultSecurityError):
 
 class VaultDecryptionError(VaultSecurityError):
     """Ciphertext authentication or decoding failed."""
+
+
+@dataclass(frozen=True)
+class CiphertextEnvelope:
+    """Strictly parsed, versioned vault ciphertext envelope."""
+
+    version: int
+    key_version: int
+    payload: bytes
+
+
+def parse_envelope(value: str) -> CiphertextEnvelope:
+    """Parse a supported ciphertext envelope without accepting ambiguous input."""
+    try:
+        if not isinstance(value, str):
+            raise ValueError("ciphertext is not text")
+        if value.startswith(LEGACY_CIPHERTEXT_PREFIX):
+            version = 1
+            key_version = 1
+            encoded = value[len(LEGACY_CIPHERTEXT_PREFIX) :]
+        elif value.startswith(CIPHERTEXT_PREFIX):
+            parts = value.split(":", 3)
+            if len(parts) != 4 or parts[0:2] != ["vmenc", "v2"]:
+                raise ValueError("invalid ciphertext prefix")
+            key_text = parts[2]
+            key_version = int(key_text)
+            if key_version < 1 or str(key_version) != key_text:
+                raise ValueError("invalid key version")
+            version = 2
+            encoded = parts[3]
+        else:
+            raise ValueError("unsupported ciphertext version")
+
+        payload = base64.b64decode(encoded.encode("ascii"), altchars=b"-_", validate=True)
+        if len(payload) < NONCE_SIZE + 16:
+            raise ValueError("ciphertext payload is too short")
+        return CiphertextEnvelope(version, key_version, payload)
+    except (binascii.Error, TypeError, ValueError, UnicodeError) as exc:
+        raise VaultDecryptionError("Vault ciphertext envelope is invalid.") from exc
 
 
 class KeyProvider(Protocol):
@@ -118,43 +160,61 @@ class VaultCipher:
 
     algorithm = "AES-256-GCM"
 
-    def __init__(self, key: bytes, project_id: str) -> None:
+    def __init__(self, key: bytes, project_id: str, key_version: int = 1) -> None:
         if len(key) != KEY_SIZE:
             raise ValueError("Vault keys must be exactly 32 bytes.")
+        if key_version < 1:
+            raise ValueError("Vault key versions must be positive integers.")
         self._aesgcm = AESGCM(key)
-        self._lookup_key = hmac.new(key, b"vibemask:v1:lookup", hashlib.sha256).digest()
+        self._lookup_key = hmac.new(
+            key,
+            f"vibemask:v2:lookup:{key_version}".encode("ascii"),
+            hashlib.sha256,
+        ).digest()
         self._project_id = project_id
+        self.key_version = key_version
 
     @staticmethod
     def is_encrypted(value: str | None) -> bool:
-        return isinstance(value, str) and value.startswith(CIPHERTEXT_PREFIX)
+        return isinstance(value, str) and value.startswith(
+            (LEGACY_CIPHERTEXT_PREFIX, CIPHERTEXT_PREFIX)
+        )
 
-    def _aad(self, context: str) -> bytes:
-        return f"vibemask:v1:{self._project_id}:{context}".encode("utf-8")
+    def _aad(self, context: str, envelope_version: int = 2) -> bytes:
+        if envelope_version == 1:
+            return f"vibemask:v1:{self._project_id}:{context}".encode("utf-8")
+        return (
+            f"vibemask:v2\0{self._project_id}\0{context}\0{self.key_version}".encode(
+                "utf-8"
+            )
+        )
 
     def encrypt(self, plaintext: str, context: str) -> str:
         nonce = secrets.token_bytes(NONCE_SIZE)
         ciphertext = self._aesgcm.encrypt(nonce, plaintext.encode("utf-8"), self._aad(context))
         payload = base64.urlsafe_b64encode(nonce + ciphertext).decode("ascii")
-        return CIPHERTEXT_PREFIX + payload
+        return f"{CIPHERTEXT_PREFIX}{self.key_version}:{payload}"
 
     def lookup_digest(self, plaintext: str, context: str) -> str:
         """Return a keyed equality token without exposing a raw PII hash."""
         message = f"{self._project_id}:{context}\0{plaintext}".encode("utf-8")
-        return "vmhmac:v1:" + hmac.new(self._lookup_key, message, hashlib.sha256).hexdigest()
+        digest = hmac.new(self._lookup_key, message, hashlib.sha256).hexdigest()
+        return f"vmhmac:v2:{self.key_version}:{digest}"
 
     def decrypt(self, value: str, context: str) -> str:
-        if not self.is_encrypted(value):
-            raise VaultDecryptionError("Refusing to decrypt an unversioned vault value.")
-        encoded = value[len(CIPHERTEXT_PREFIX) :]
+        envelope = parse_envelope(value)
+        if envelope.key_version != self.key_version:
+            raise VaultDecryptionError("Vault ciphertext requires another key version.")
         try:
-            payload = base64.urlsafe_b64decode(encoded.encode("ascii"))
-            if len(payload) <= NONCE_SIZE:
-                raise ValueError("ciphertext payload is too short")
-            nonce, ciphertext = payload[:NONCE_SIZE], payload[NONCE_SIZE:]
-            plaintext = self._aesgcm.decrypt(nonce, ciphertext, self._aad(context))
+            nonce = envelope.payload[:NONCE_SIZE]
+            ciphertext = envelope.payload[NONCE_SIZE:]
+            plaintext = self._aesgcm.decrypt(
+                nonce,
+                ciphertext,
+                self._aad(context, envelope_version=envelope.version),
+            )
             return plaintext.decode("utf-8")
-        except (InvalidTag, ValueError, UnicodeError) as exc:
+        except (InvalidTag, UnicodeError) as exc:
             raise VaultDecryptionError(
                 "Vault ciphertext authentication failed; the key or stored data is invalid."
             ) from exc
