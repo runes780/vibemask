@@ -133,12 +133,16 @@ class VaultStorage:
         # Initialize database
         self._init_db()
         self.active_key_version = self._read_active_key_version()
-        encrypted_data_exists = self._contains_encrypted_data()
+        key_material_required = (
+            self._contains_encrypted_data()
+            or self._has_audit_history()
+            or self.key_store.get_trusted_state(self.project_id) is not None
+        )
         key = resolve_encryption_key(
             self.key_store,
             self.project_id,
             self.active_key_version,
-            encrypted_data_exists=encrypted_data_exists,
+            encrypted_data_exists=key_material_required,
         )
         self._cipher = VaultCipher(
             key, self.project_id, key_version=self.active_key_version
@@ -272,6 +276,14 @@ class VaultStorage:
                 prefixes * 3,
             ).fetchone()
             return mapping is not None or session is not None
+        finally:
+            conn.close()
+
+    def _has_audit_history(self) -> bool:
+        """Return whether this database has already committed a security baseline."""
+        conn = self._connect()
+        try:
+            return conn.execute("SELECT 1 FROM vault_audit LIMIT 1").fetchone() is not None
         finally:
             conn.close()
 

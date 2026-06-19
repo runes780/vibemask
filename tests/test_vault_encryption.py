@@ -309,6 +309,31 @@ def test_encrypted_vault_with_missing_key_fails_closed(tmp_path, monkeypatch):
         VaultStorage(str(project), key_store=MemoryKeyProvider())
 
 
+def test_empty_audited_vault_with_missing_key_fails_closed(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    project = tmp_path / "project"
+    original_provider = MemoryKeyProvider()
+    vault = VaultStorage(str(project), key_store=original_provider)
+
+    assert vault.security_status()["epoch"] == 0
+    with pytest.raises(VaultKeyMissingError):
+        VaultStorage(str(project), key_store=MemoryKeyProvider())
+
+
+def test_missing_key_is_not_replaced_when_trusted_anchor_exists(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    project = tmp_path / "project"
+    provider = MemoryKeyProvider()
+    vault = VaultStorage(str(project), key_store=provider)
+    provider.delete_encryption_key(vault.project_id, 1)
+    with sqlite3.connect(vault.vault_path) as conn:
+        conn.execute("DELETE FROM vault_audit")
+
+    with pytest.raises(VaultKeyMissingError):
+        VaultStorage(str(project), key_store=provider)
+    assert provider.get_encryption_key(vault.project_id, 1) is None
+
+
 def test_cli_status_reports_encryption_without_exposing_values(tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
     from vibemask.cli import app

@@ -16,7 +16,7 @@
 
 ### Latest local verification (2026-06-19)
 
-- `pytest tests/ -v`: **167 passed**, 6 upstream deprecation warnings.
+- `pytest tests/ -v`: **169 passed**, 6 upstream deprecation warnings.
 - Security-scope Ruff gate: passed.
 - Clean temporary environment with `pip 26.1.2`: `pip-audit` reported no known
   dependency vulnerabilities; CycloneDX 1.6 SBOM generation produced 80 components.

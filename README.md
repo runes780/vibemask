@@ -10,7 +10,7 @@ Automatically mask sensitive information before AI processing, then restore afte
 
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](https://opensource.org/licenses/MIT)
-[![Tests](https://img.shields.io/badge/tests-167%20passed-brightgreen.svg)]()
+[![Tests](https://img.shields.io/badge/tests-169%20passed-brightgreen.svg)]()
 
 [Features](#-features) • [Quick Start](#-quick-start) • [Documentation](#-documentation) • [Architecture](#-architecture)
 
