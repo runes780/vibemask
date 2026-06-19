@@ -17,6 +17,7 @@ from vibemask.vault.crypto import (
     resolve_vault_key,
 )
 from vibemask.vault.storage import VaultStorage, get_project_fingerprint, get_vault_path
+from vibemask.vault.keyring_policy import TrustedState
 
 
 class MemoryKeyProvider:
@@ -24,12 +25,42 @@ class MemoryKeyProvider:
 
     def __init__(self):
         self.keys: dict[str, bytes] = {}
+        self.versioned_keys: dict[tuple[str, int], bytes] = {}
+        self.integrity_keys: dict[str, bytes] = {}
+        self.states: dict[str, TrustedState] = {}
 
     def get_key(self, project_id: str) -> bytes | None:
         return self.keys.get(project_id)
 
     def set_key(self, project_id: str, key: bytes) -> None:
         self.keys[project_id] = key
+
+    def get_encryption_key(self, project_id: str, version: int) -> bytes | None:
+        return self.versioned_keys.get((project_id, version))
+
+    def set_encryption_key(self, project_id: str, version: int, key: bytes) -> None:
+        self.versioned_keys[(project_id, version)] = key
+
+    def delete_encryption_key(self, project_id: str, version: int) -> None:
+        self.versioned_keys.pop((project_id, version), None)
+
+    def get_integrity_key(self, project_id: str) -> bytes | None:
+        return self.integrity_keys.get(project_id)
+
+    def set_integrity_key(self, project_id: str, key: bytes) -> None:
+        self.integrity_keys[project_id] = key
+
+    def delete_integrity_key(self, project_id: str) -> None:
+        self.integrity_keys.pop(project_id, None)
+
+    def get_trusted_state(self, project_id: str) -> TrustedState | None:
+        return self.states.get(project_id)
+
+    def set_trusted_state(self, project_id: str, state: TrustedState) -> None:
+        self.states[project_id] = state
+
+    def delete_trusted_state(self, project_id: str) -> None:
+        self.states.pop(project_id, None)
 
 
 def test_vault_cipher_roundtrip_is_randomized():
@@ -110,7 +141,7 @@ def test_vault_storage_encrypts_mapping_and_session_fields_at_rest(tmp_path, mon
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
     provider = MemoryKeyProvider()
     project = tmp_path / "project"
-    vault = VaultStorage(str(project), key_provider=provider)
+    vault = VaultStorage(str(project), key_store=provider)
 
     masked = vault.get_or_create_mapping(
         "SYNTHETIC-PII-AT-REST",
@@ -142,7 +173,7 @@ def test_vault_storage_encrypts_mapping_and_session_fields_at_rest(tmp_path, mon
 def test_vault_storage_keeps_stable_mapping_with_encrypted_original(tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
     provider = MemoryKeyProvider()
-    vault = VaultStorage(str(tmp_path / "project"), key_provider=provider)
+    vault = VaultStorage(str(tmp_path / "project"), key_store=provider)
 
     first = vault.get_or_create_mapping("SYNTHETIC-STABLE", "PERSON", "{{PERSON_1}}")
     second = vault.get_or_create_mapping("SYNTHETIC-STABLE", "PERSON", "{{PERSON_2}}")
@@ -218,16 +249,16 @@ def test_legacy_plaintext_vault_is_migrated_transactionally(tmp_path, monkeypatc
     _create_legacy_plaintext_vault(vault_path, project_id)
     provider = MemoryKeyProvider()
 
-    vault = VaultStorage(str(project), key_provider=provider)
+    vault = VaultStorage(str(project), key_store=provider)
 
     assert vault.get_mapping_by_masked("{{PERSON_LEGACY}}") == "SYNTHETIC-LEGACY-PII"
     session = vault.get_session("legacy-session")
     assert session is not None
     assert session.mappings == {"{{PERSON_LEGACY}}": "SYNTHETIC-LEGACY-PII"}
     assert b"SYNTHETIC-LEGACY-PII" not in vault_path.read_bytes()
-    assert vault.get_stats()["encryption_version"] == 1
+    assert vault.get_stats()["encryption_version"] == 2
 
-    reopened = VaultStorage(str(project), key_provider=provider)
+    reopened = VaultStorage(str(project), key_store=provider)
     assert reopened.get_mapping_by_masked("{{PERSON_LEGACY}}") == "SYNTHETIC-LEGACY-PII"
 
 
@@ -251,7 +282,7 @@ def test_legacy_migration_rolls_back_all_sensitive_fields_on_failure(tmp_path, m
     monkeypatch.setattr(VaultCipher, "encrypt", fail_after_first_encrypt)
 
     with pytest.raises(RuntimeError, match="synthetic migration failure"):
-        VaultStorage(str(project), key_provider=provider)
+        VaultStorage(str(project), key_store=provider)
 
     conn = sqlite3.connect(vault_path)
     try:
@@ -271,11 +302,11 @@ def test_encrypted_vault_with_missing_key_fails_closed(tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
     project = tmp_path / "project"
     provider = MemoryKeyProvider()
-    vault = VaultStorage(str(project), key_provider=provider)
+    vault = VaultStorage(str(project), key_store=provider)
     vault.get_or_create_mapping("SYNTHETIC-KEY-LOSS", "PERSON", "{{PERSON_1}}")
 
     with pytest.raises(VaultKeyMissingError):
-        VaultStorage(str(project), key_provider=MemoryKeyProvider())
+        VaultStorage(str(project), key_store=MemoryKeyProvider())
 
 
 def test_cli_status_reports_encryption_without_exposing_values(tmp_path, monkeypatch):

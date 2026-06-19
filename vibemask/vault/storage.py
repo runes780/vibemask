@@ -15,14 +15,13 @@ from dataclasses import dataclass
 
 from .crypto import (
     CIPHERTEXT_PREFIX,
-    KeyProvider,
-    KeyringKeyProvider,
+    LEGACY_CIPHERTEXT_PREFIX,
     VaultCipher,
-    resolve_vault_key,
 )
+from .keyring_policy import NativeKeyringStore, SecureKeyStore, resolve_encryption_key
 
 
-ENCRYPTION_VERSION = 1
+ENCRYPTION_VERSION = 2
 
 
 @dataclass
@@ -81,9 +80,9 @@ def get_vault_path(project_path: str) -> Path:
     return get_vibemask_home() / "projects" / fingerprint / "vault.sqlite"
 
 
-def default_key_provider() -> KeyProvider:
+def default_key_store() -> SecureKeyStore:
     """Return the production key provider; tests replace this factory."""
-    return KeyringKeyProvider()
+    return NativeKeyringStore()
 
 
 class VaultStorage:
@@ -96,11 +95,12 @@ class VaultStorage:
     - Session tracking for restoration
     """
     
-    def __init__(self, project_path: str, key_provider: Optional[KeyProvider] = None):
+    def __init__(self, project_path: str, key_store: Optional[SecureKeyStore] = None):
         self.project_path = project_path
         self.project_id = get_project_fingerprint(project_path)
         self.vault_path = get_vault_path(project_path)
-        self.key_provider = key_provider or default_key_provider()
+        self.key_store = key_store or default_key_store()
+        self.key_provider = self.key_store
         
         # Ensure directory exists
         self.vault_path.parent.mkdir(parents=True, exist_ok=True)
@@ -109,12 +109,13 @@ class VaultStorage:
         # Initialize database
         self._init_db()
         encrypted_data_exists = self._contains_encrypted_data()
-        key = resolve_vault_key(
-            self.key_provider,
+        key = resolve_encryption_key(
+            self.key_store,
             self.project_id,
+            1,
             encrypted_data_exists=encrypted_data_exists,
         )
-        self._cipher = VaultCipher(key, self.project_id)
+        self._cipher = VaultCipher(key, self.project_id, key_version=1)
         self._migrate_sensitive_fields()
         self._ensure_private_permissions()
 
@@ -203,17 +204,20 @@ class VaultStorage:
         """Check only ciphertext markers; never load or expose stored plaintext."""
         conn = sqlite3.connect(self.vault_path)
         try:
-            prefix = f"{CIPHERTEXT_PREFIX}%"
+            prefixes = (f"{LEGACY_CIPHERTEXT_PREFIX}%", f"{CIPHERTEXT_PREFIX}%")
             mapping = conn.execute(
-                "SELECT 1 FROM mappings WHERE original_text LIKE ? LIMIT 1", (prefix,)
+                "SELECT 1 FROM mappings WHERE original_text LIKE ? OR original_text LIKE ? LIMIT 1",
+                prefixes,
             ).fetchone()
             session = conn.execute(
                 """
                 SELECT 1 FROM sessions
-                WHERE input_files LIKE ? OR output_files LIKE ? OR mappings LIKE ?
+                WHERE input_files LIKE ? OR input_files LIKE ?
+                   OR output_files LIKE ? OR output_files LIKE ?
+                   OR mappings LIKE ? OR mappings LIKE ?
                 LIMIT 1
                 """,
-                (prefix, prefix, prefix),
+                prefixes * 3,
             ).fetchone()
             return mapping is not None or session is not None
         finally:
@@ -244,11 +248,11 @@ class VaultStorage:
         ).fetchone()
         if version is None or version[0] != str(ENCRYPTION_VERSION):
             return True
-        prefix = f"{CIPHERTEXT_PREFIX}%"
+        prefix = f"{CIPHERTEXT_PREFIX}1:%"
         mapping = conn.execute(
             """
-            SELECT 1 FROM mappings
-            WHERE original_text NOT LIKE ? OR original_digest IS NULL
+            SELECT 1 FROM mappings WHERE original_text NOT LIKE ?
+               OR original_digest IS NULL OR original_digest NOT LIKE 'vmhmac:v2:1:%'
             LIMIT 1
             """,
             (prefix,),
@@ -285,10 +289,11 @@ class VaultStorage:
                     plaintext = original_text
                     original_text = self._cipher.encrypt(plaintext, context)
                     migrated_plaintext = True
-                digest = original_digest or self._cipher.lookup_digest(plaintext, "mapping-original")
+                if not original_digest or not original_digest.startswith("vmhmac:v2:1:"):
+                    original_digest = self._cipher.lookup_digest(plaintext, "mapping-original")
                 conn.execute(
                     "UPDATE mappings SET original_text = ?, original_digest = ? WHERE entity_id = ?",
-                    (original_text, digest, entity_id),
+                    (original_text, original_digest, entity_id),
                 )
 
             session_rows = conn.execute(
